@@ -1,0 +1,4 @@
+services:
+  nginx:
+    environment:
+      NGINX_TEMPLATE: https.conf.template

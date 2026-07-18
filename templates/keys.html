@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Keys and team · Clipboard Vault{% endblock %}
+{% block nav %}<nav class="nav"><a href="/">Vault</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
+{% block content %}
+<section class="page-heading"><span class="eyebrow">{{ workspace_name }}</span><h1>Automation and access</h1><p>Keys are tied to this workspace. The complete key is shown only once.</p></section>
+<div class="two-column">
+  <section class="panel"><h2>Create API key</h2><form action="/keys/create" method="post" class="stack">
+    <label>Name<input name="name" placeholder="Laptop uploader" required maxlength="80"></label>
+    <label>Expires after<select name="expires_in_days"><option value="30">30 days</option><option value="90" selected>90 days</option><option value="365">1 year</option></select></label>
+    <label class="check"><input type="checkbox" name="read"> Allow reading items</label>
+    <label class="check"><input type="checkbox" name="delete"> Allow deleting items</label>
+    <button class="button primary" type="submit">Create key</button>
+  </form></section>
+  {% if can_manage %}<section class="panel"><h2>Invite a teammate</h2><p>Create a private link and send it yourself. It expires after 48 hours.</p>
+    <form action="/invitations/create" method="post" class="stack"><label>Role<select name="role"><option value="member">Member</option><option value="admin">Workspace admin</option></select></label><button class="button" type="submit">Create invitation</button></form>
+  </section>{% endif %}
+</div>
+{% if can_manage %}
+<section class="panel"><div class="panel-heading"><h2>Workspace settings</h2><span>Server maximum applies</span></div>
+  <form action="/workspaces/settings" method="post" class="inline-form"><label>Maximum upload (MB)<input type="number" name="max_upload_mb" min="1" value="{{ max_upload_mb }}" required></label><button class="button" type="submit">Save limit</button></form>
+</section>
+<section class="panel table-panel"><div class="panel-heading"><h2>Members</h2><span>{{ members.len() }} people</span></div><div class="table-wrap"><table><thead><tr><th>Person</th><th>Role</th><th>Joined</th><th>Actions</th></tr></thead><tbody>
+  {% for member in members %}<tr><td><strong>{{ member.name }}</strong><br><span class="muted">{{ member.email }}</span></td><td>{{ member.role }}</td><td>{{ member.created_at }}</td><td class="actions-cell">
+  {% if member.role != "owner" %}<form action="/workspaces/members/{{ member.id }}/role" method="post"><select name="role" aria-label="Role for {{ member.name }}"><option value="member" {% if member.role == "member" %}selected{% endif %}>Member</option><option value="admin" {% if member.role == "admin" %}selected{% endif %}>Admin</option></select><button class="link-button" type="submit">Update</button></form>
+  <form action="/workspaces/members/{{ member.id }}/remove" method="post"><button class="link-button danger" type="submit">Remove</button></form>{% endif %}
+  {% if is_owner && member.role != "owner" %}<form action="/workspaces/members/{{ member.id }}/transfer" method="post"><button class="link-button" type="submit">Make owner</button></form>{% endif %}
+  </td></tr>{% endfor %}
+  </tbody></table></div></section>
+{% endif %}
+<section class="panel table-panel"><div class="panel-heading"><h2>API keys</h2><span>{{ keys.len() }} keys</span></div>
+  <div class="table-wrap"><table><thead><tr><th>Name</th><th>Prefix</th><th>Permissions</th><th>Expires</th><th></th></tr></thead><tbody>
+  {% for key in keys %}<tr><td>{{ key.name }}</td><td><code>{{ key.start }}…</code></td><td>{{ key.permissions|join(", ") }}</td><td>{{ key.expires_at.as_deref().unwrap_or("Never") }}</td><td><form action="/keys/{{ key.id }}/revoke" method="post"><button class="link-button danger" type="submit">Revoke</button></form></td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% if is_owner %}<section class="panel danger-zone"><h2>Delete workspace</h2><p>This permanently removes the workspace metadata and stored files. Type <strong>{{ workspace_name }}</strong> to confirm.</p><form action="/workspaces/delete" method="post" class="inline-form"><label>Workspace name<input name="confirmation" required autocomplete="off"></label><button class="button danger" type="submit">Delete permanently</button></form></section>{% endif %}
+{% endblock %}

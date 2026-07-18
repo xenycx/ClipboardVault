@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Clipboard Vault{% endblock %}
+{% block content %}
+<section class="auth-layout">
+  <div class="auth-copy">
+    <span class="eyebrow">SELF-HOSTED TEAM VAULT</span>
+    <h1>Keep useful fragments close.</h1>
+    <p>Paste text, store files, and send uploads from your scripts. Your account must be approved before workspace data opens.</p>
+  </div>
+  <div class="panel auth-panel">
+    <h2>Sign in</h2>
+    <button class="button google" type="button" data-google-login>Continue with Google</button>
+    <div class="divider"><span>or</span></div>
+    <form data-auth-form="signin" class="stack">
+      <label>Email<input type="email" name="email" autocomplete="email" required></label>
+      <label>Password<input type="password" name="password" autocomplete="current-password" minlength="8" required></label>
+      <button class="button primary" type="submit">Sign in</button>
+    </form>
+    <details>
+      <summary>Create an account</summary>
+      <form data-auth-form="signup" class="stack compact">
+        <label>Name<input name="name" autocomplete="name" required maxlength="80"></label>
+        <label>Email<input type="email" name="email" autocomplete="email" required></label>
+        <label>Password<input type="password" name="password" autocomplete="new-password" minlength="8" maxlength="128" required></label>
+        <button class="button" type="submit">Register for approval</button>
+      </form>
+    </details>
+    <p class="form-error" data-auth-error role="alert"></p>
+  </div>
+</section>
+{% endblock %}
+

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Account approvals · Clipboard Vault{% endblock %}
+{% block nav %}<nav class="nav"><a href="/">Vault</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
+{% block content %}
+<section class="page-heading"><span class="eyebrow">GLOBAL ADMINISTRATION</span><h1>Account approvals</h1><p>Approving an account creates its personal workspace. Invited accounts still require approval.</p></section>
+<section class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>User</th><th>Status</th><th>Global role</th><th>Created</th><th>Actions</th></tr></thead><tbody>
+{% for user in users %}<tr><td><strong>{{ user.name }}</strong><br><span class="muted">{{ user.email }}</span></td><td><span class="status {{ user.approval_status }}">{{ user.approval_status }}</span></td><td>{{ user.role }}</td><td>{{ user.created_at }}</td><td class="actions-cell">
+{% if user.approval_status != "approved" %}<form action="/admin/users/{{ user.id }}/approve" method="post"><button class="link-button" type="submit">Approve</button></form>{% endif %}
+{% if user.approval_status != "rejected" && !user.role.contains("admin") %}<form action="/admin/users/{{ user.id }}/reject" method="post"><button class="link-button danger" type="submit">Reject</button></form>{% endif %}
+<form action="/admin/users/{{ user.id }}/reset" method="post"><button class="link-button" type="submit">Reset password</button></form>
+</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}

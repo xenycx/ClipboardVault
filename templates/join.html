@@ -1,0 +1,4 @@
+{% extends "base.html" %}
+{% block title %}Join workspace · Clipboard Vault{% endblock %}
+{% block content %}<section class="center-card panel"><span class="eyebrow">PRIVATE INVITATION</span><h1>Join this workspace</h1>{% if signed_in %}<p>This one-time invitation will add your approved account to the workspace.</p><form method="post"><button class="button primary" type="submit">Accept invitation</button></form>{% else %}<p>Sign in and wait for account approval before accepting this invitation.</p><a class="button primary" href="/login?returnTo=/join/{{ token }}">Sign in</a>{% endif %}</section>{% endblock %}
+

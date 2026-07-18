@@ -1,0 +1,37 @@
+[package]
+name = "clipboard-vault"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "A fast, self-hosted team vault for pasted content and files"
+
+[dependencies]
+anyhow = "1.0"
+askama = "0.14"
+axum = { version = "0.8", features = ["http2", "json", "multipart", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1.3"
+hex = "0.4"
+mime_guess = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+thiserror = "2.0"
+tokio = { version = "1.45", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip", "fs", "limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2.5"
+uuid = { version = "1.16", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

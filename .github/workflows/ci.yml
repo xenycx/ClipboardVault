@@ -1,0 +1,118 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+  auth:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: auth
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: auth/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - run: pytest -q tests
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+
+  images:
+    runs-on: ubuntu-latest
+    needs: [rust, auth, contracts]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: clipboard-vault:ci
+      - uses: docker/build-push-action@v6
+        with:
+          context: auth
+          push: false
+          tags: clipboard-vault-auth:ci
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: [rust, auth, contracts]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure test deployment
+        run: |
+          cp .env.example .env
+          sed -i 's|DOMAIN=vault.example.com|DOMAIN=localhost|' .env
+          sed -i 's|PUBLIC_BASE_URL=https://vault.example.com|PUBLIC_BASE_URL=http://localhost|' .env
+      - name: Build and start the stack
+        run: docker compose up -d --build
+      - name: Wait for readiness
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost/health/ready; then exit 0; fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Bootstrap account and API key
+        run: |
+          curl -fsS -c cookies.txt -H 'Origin: http://localhost' -H 'Content-Type: application/json' \
+            -d '{"name":"CI Admin","email":"ci@example.test","password":"correct-horse-battery-staple"}' \
+            http://localhost/api/auth/sign-up/email
+          curl -fsS -b cookies.txt -H 'Origin: http://localhost' -H 'Content-Type: application/json' \
+            -d '{"token":"replace-with-at-least-32-random-bytes"}' \
+            http://localhost/api/auth/vault/bootstrap
+          user_id=$(docker compose exec -T postgres psql -U vault -d clipboard_vault -Atc "SELECT id FROM \"user\" WHERE email='ci@example.test'")
+          organization_id=$(docker compose exec -T postgres psql -U vault -d clipboard_vault -Atc "SELECT \"organizationId\" FROM member WHERE \"userId\"='$user_id' LIMIT 1")
+          key_json=$(docker compose exec -T -e TEST_USER_ID="$user_id" -e TEST_ORG_ID="$organization_id" auth node -e \
+            'fetch("http://127.0.0.1:3001/internal/api-keys", {method:"POST", headers:{"content-type":"application/json","x-auth-bridge-secret":process.env.AUTH_BRIDGE_SECRET}, body:JSON.stringify({organizationId:process.env.TEST_ORG_ID,requesterId:process.env.TEST_USER_ID,name:"CI uploader",expiresInDays:1,permissions:["items:write","items:read","items:delete"]})}).then(async r=>{const text=await r.text();if(!r.ok)throw new Error(text);process.stdout.write(text)})')
+          echo "$key_json" | jq -r '.data.secret' > api-key.txt
+          test -s api-key.txt
+      - name: Run Python uploader end to end
+        run: |
+          python -m pip install requests
+          printf 'integration upload\n' > integration.txt
+          python examples/upload_file.py integration.txt --server http://localhost --api-key "$(cat api-key.txt)" --path /ci --tag integration
+          curl -fsS -H "X-API-Key: $(cat api-key.txt)" 'http://localhost/api/v1/items?tag=integration' | jq -e '.items | length == 1'
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v

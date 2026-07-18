@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block nav %}
+<nav class="nav">
+  <form action="/workspaces/switch" method="post">
+    <select name="organization_id" aria-label="Active workspace" onchange="this.form.submit()">
+      {% for membership in session.memberships %}<option value="{{ membership.organization_id }}" {% if membership.organization_id == session.active_organization_id.as_deref().unwrap_or("") %}selected{% endif %}>{{ membership.organization_name }}</option>{% endfor %}
+    </select>
+  </form>
+  <a href="/keys">Keys & team</a>
+  {% if session.user.role.contains("admin") %}<a href="/admin">Accounts</a>{% endif %}
+  <button class="link-button" type="button" data-signout>Sign out</button>
+</nav>
+{% endblock %}
+{% block content %}
+<section class="hero-row">
+  <div><span class="eyebrow">{{ active_workspace_name }}</span><h1>Your working memory, organized.</h1><p>Paste deliberately or send files with an API key. Nothing reads your clipboard in the background.</p></div>
+  <div class="metric"><strong>{{ items.len() }}</strong><span>recent items</span></div>
+</section>
+<section class="capture-grid">
+  <form action="/capture" method="post" class="panel composer">
+    <div class="panel-heading"><h2>Paste something</h2><span>Manual capture</span></div>
+    <label class="sr-only" for="payload">Content</label>
+    <textarea id="payload" name="payload" rows="8" placeholder="Paste text, code, HTML, or a URL…" required></textarea>
+    <div class="form-grid">
+      <label>Type<select name="kind"><option value="auto">Detect automatically</option><option value="text">Text</option><option value="code">Code</option><option value="html">HTML</option><option value="url">URL</option></select></label>
+      <label>Virtual folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
+      <label>Tags<input name="tags" placeholder="work, reference"></label>
+      <label>Source URL<input type="url" name="source_url" placeholder="https://…"></label>
+    </div>
+    <button class="button primary" type="submit">Save to vault</button>
+  </form>
+  <form action="/api/v1/items" method="post" enctype="multipart/form-data" class="panel uploader" data-upload-form>
+    <div class="panel-heading"><h2>Upload a file</h2><span>Up to {{ max_upload_mb }} MB</span></div>
+    <label class="dropzone" data-dropzone><input type="file" name="file" required><strong>Drop any file here</strong><span>or choose a file</span></label>
+    <label>Virtual folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
+    <label>Tags<input name="tags" placeholder="report, monthly"></label>
+    <button class="button" type="submit">Upload file</button>
+    <progress data-upload-progress max="100" value="0" hidden></progress>
+  </form>
+</section>
+<section class="items-section">
+  <div class="section-heading"><div><span class="eyebrow">LATEST</span><h2>Vault items</h2></div><input type="search" placeholder="Filter this page" data-item-filter aria-label="Filter items"></div>
+  <div class="item-list" role="region" aria-live="polite">
+    {% if items.is_empty() %}<div class="empty panel"><h3>Your vault is empty</h3><p>Paste content above or upload a file. Clipboard Vault only stores what you explicitly submit.</p></div>{% endif %}
+    {% for item in items %}
+    <article class="item-card" data-item-card data-search="{{ item.kind }} {{ item.virtual_path }} {{ item.original_filename.as_deref().unwrap_or("") }}">
+      <div class="type-pill {{ item.kind }}">{{ item.kind }}</div>
+      <div class="item-body">
+        <div class="item-meta"><span>{{ item.virtual_path }}</span><span>{{ item.size_bytes }} bytes</span><time>{{ item.created_at.format("%Y-%m-%d %H:%M") }}</time></div>
+        {% match item.text_payload %}{% when Some with (payload) %}{% if item.kind == "html" %}<iframe class="html-preview" sandbox="" referrerpolicy="no-referrer" srcdoc="{{ payload }}" title="Sandboxed HTML preview"></iframe><details><summary>View escaped source</summary><pre>{{ payload }}</pre></details>{% else %}<pre>{{ payload }}</pre>{% endif %}{% when None %}<a class="file-link" href="/api/v1/items/{{ item.id }}/content">{{ item.original_filename.as_deref().unwrap_or("Download file") }}</a>{% endmatch %}
+      </div>
+      <div class="item-actions">
+        {% match item.text_payload %}{% when Some with (payload) %}<button class="icon-button" type="button" data-copy-value="{{ payload }}">Copy</button>{% when None %}{% endmatch %}
+        <button class="icon-button danger" type="button" data-delete-id="{{ item.id }}">Delete</button>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

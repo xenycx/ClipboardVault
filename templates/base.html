@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{% block title %}Clipboard Vault{% endblock %}</title>
+  <meta name="description" content="A fast private workspace for pasted content and files.">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark">CV</span><span>Clipboard Vault</span></a>
+    {% block nav %}{% endblock %}
+  </header>
+  <main class="shell">{% block content %}{% endblock %}</main>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
+

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}First administrator setup · Clipboard Vault{% endblock %}
+{% block content %}
+<section class="center-card panel">
+  <span class="eyebrow">ONE-TIME SETUP</span><h1>Claim the first administrator</h1>
+  <p>Sign in or register first, then paste the private setup token from the VPS <code>.env</code> file. This page closes after the first administrator is created.</p>
+  <form data-bootstrap class="stack">
+    <label>Setup token<input type="password" name="token" autocomplete="off" required></label>
+    <button class="button primary" type="submit">Make my account administrator</button>
+  </form>
+  <p class="form-error" data-auth-error role="alert"></p>
+</section>
+{% endblock %}

@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Account review · Clipboard Vault{% endblock %}
+{% block content %}
+<section class="center-card panel">
+  {% if rejected %}
+  <span class="status rejected">Not approved</span><h1>Access was not approved</h1>
+  <p>Ask the server administrator if you believe this is a mistake.</p>
+  {% else %}
+  <span class="status pending">Pending</span><h1>Welcome, {{ name }}</h1>
+  <p>Your login works. A global administrator must approve the account before it can see any workspace.</p>
+  {% endif %}
+  <button class="button" type="button" data-signout>Sign out</button>
+</section>
+{% endblock %}
+
