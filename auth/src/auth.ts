@@ -107,6 +107,7 @@ export const auth = betterAuth({
     }),
     apiKey({
       references: "organization",
+      enableMetadata: true,
       defaultPrefix: "cv_live_",
       keyExpiration: { defaultExpiresIn: 90 * 24 * 60 * 60, maxExpiresIn: 3650 },
       rateLimit: { enabled: true, timeWindow: 60_000, maxRequests: 120 },
