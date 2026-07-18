@@ -140,10 +140,9 @@ pub fn api_key_from_headers(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
+        && !value.trim().is_empty()
     {
-        if !value.trim().is_empty() {
-            return Some(value.trim().to_owned());
-        }
+        return Some(value.trim().to_owned());
     }
     headers
         .get(header::AUTHORIZATION)

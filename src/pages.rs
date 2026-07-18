@@ -458,12 +458,10 @@ pub async fn delete_workspace(
         if path
             .components()
             .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && let Err(error) = tokio::fs::remove_file(state.upload_root.join(path)).await
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            if let Err(error) = tokio::fs::remove_file(state.upload_root.join(path)).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(%error, %storage_key, "failed to remove deleted workspace file");
-                }
-            }
+            tracing::warn!(%error, %storage_key, "failed to remove deleted workspace file");
         }
     }
     let mut response = Redirect::to("/").into_response();
