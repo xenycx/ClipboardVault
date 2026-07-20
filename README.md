@@ -9,14 +9,15 @@ stores searchable metadata; file bytes stay on a persistent VPS volume.
 ## What it does
 
 - Manual paste composer with text, code, HTML, and URL detection.
-- Arbitrary streamed file uploads without loading the whole file into memory.
+- Resumable, streamed file uploads up to 10 GiB without loading the whole file into memory.
+- Inline previews for text, code, safe HTML/Markdown, images, and ranged PDFs.
 - Private workspaces with owner, admin, and member roles.
 - Global approval queue for every new account.
 - Google and password login through Better Auth.
 - Workspace API keys with read, write, and delete permissions.
-- Ready-to-run Python file uploader.
+- Ready-to-run Python multipart and resumable file uploaders.
 - Trash, restore, search, tags, exports, and activity records.
-- Docker Compose, Nginx, Certbot, health checks, backups, and GitHub Actions.
+- Docker Compose, Nginx, Certbot, health checks, and GitHub Actions.
 
 Clipboard Vault never reads the browser clipboard. The only clipboard operation is an
 explicit Copy button clicked by the user.
@@ -143,6 +144,16 @@ curl -X POST "https://vault.example.com/api/v1/items" \
 
 Both `Authorization: Bearer` and `X-API-Key` are supported.
 
+The multipart endpoint is retained for compatibility and accepts files up to 100 MiB.
+Larger files use the Tus 1.0 endpoint. The browser uploads in 16 MiB chunks and can pause,
+retry, or resume from the last server-confirmed offset after an interruption. Tus upload
+sessions expire after seven idle days.
+
+The deployment ceiling is 10 GiB per file. A workspace starts at 100 MiB; an owner or admin
+may raise that workspace limit up to the deployment ceiling. Uploads are rejected with
+`507 Insufficient Storage` before the upload volume would cross its configured free-space
+reserve. Clipboard Vault never deletes files automatically.
+
 Soft-deleted items are listed with `GET /api/v1/items?trash=true`, restored with
 `POST /api/v1/items/{id}/restore`, and permanently removed with
 `POST /api/v1/items/{id}/purge`.
@@ -157,6 +168,27 @@ python examples/upload_file.py ./report.pdf \
   --path /reports/2026 \
   --tag report --tag monthly
 ```
+
+Use the resumable example for larger files or unreliable connections:
+
+```bash
+python examples/upload_resumable.py ./archive.tar.zst \
+  --server https://vault.example.com \
+  --api-key cv_live_REPLACE_ME \
+  --path /archives
+```
+
+The resumable example prints the session URL. Re-run it with `--upload-url` to continue a
+known session from the authoritative server offset.
+
+### Previews and downloads
+
+The dashboard loads previews only when requested. Text and code are syntax-highlighted up to
+1 MiB, displayed as plain text up to 10 MiB, and truncated to the first 10 MiB above that.
+Markdown and HTML rendered previews are sanitized and always retain an inert source view.
+Common raster images up to 50 MiB and PDFs are displayed inline; PDF and download responses
+support byte ranges. The original Download action remains available for every file, including
+files that are unsafe or too large to preview.
 
 The API returns a consistent error body:
 
@@ -174,12 +206,18 @@ The API returns a consistent error body:
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/v1/items` | Create pasted JSON content or upload one multipart file |
+| `POST` | `/api/v1/items` | Create pasted JSON content or upload one multipart file (100 MiB maximum) |
 | `GET` | `/api/v1/items` | List/search active items; add `trash=true` for trash |
 | `GET/PATCH/DELETE` | `/api/v1/items/{id}` | Read, edit metadata, or move an item to trash |
 | `POST` | `/api/v1/items/{id}/restore` | Restore a trashed item |
 | `POST` | `/api/v1/items/{id}/purge` | Permanently remove a trashed item and unreferenced bytes |
-| `GET` | `/api/v1/items/{id}/content` | Stream stored file bytes |
+| `GET/HEAD` | `/api/v1/items/{id}/content` | Stream stored bytes; supports Range and `?download=1` |
+| `GET/HEAD` | `/api/v1/items/{id}/preview` | Stream a classified, authenticated preview response |
+| `OPTIONS/POST` | `/api/v1/uploads` | Discover Tus support or create a resumable upload |
+| `GET/HEAD/PATCH/DELETE` | `/api/v1/uploads/{id}` | Read status, inspect offset, append, or cancel a Tus upload |
+| `GET` | `/api/v1/uploads/{id}/status` | Read finalization state and completed item ID |
+| `GET` | `/api/v1/storage` | Workspace usage, reservations, free space, and cleanup candidates |
+| `POST` | `/api/v1/storage/purge` | Explicitly purge selected file items (owner/admin) |
 | `GET` | `/api/v1/items/export?format=json|csv` | Export active item metadata and text |
 | `GET` | `/api/v1/tags` | List workspace tags |
 | `GET` | `/health/live`, `/health/ready` | Process and dependency health |
@@ -200,7 +238,7 @@ VPS. Production images compile Rust inside the official Linux Rust container.
 
 ## Documentation
 
-- [VPS deployment, HTTPS, backups, upgrades, and recovery](DEPLOYMENT.md)
+- [VPS deployment, HTTPS, upgrades, and rollback](DEPLOYMENT.md)
 - [Security model and reporting](SECURITY.md)
 - [.env configuration template](.env.example)
 

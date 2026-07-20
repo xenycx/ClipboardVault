@@ -7,6 +7,7 @@
     </select>
   </form>
   <a href="/keys">Keys & team</a>
+  <a href="/storage">Storage</a>
   {% if session.user.role.contains("admin") %}<a href="/admin">Accounts</a>{% endif %}
   <button class="link-button" type="button" data-signout>Sign out</button>
 </nav>
@@ -16,6 +17,10 @@
   <div><span class="eyebrow">{{ active_workspace_name }}</span><h1>Your working memory, organized.</h1><p>Paste deliberately or send files with an API key. Nothing reads your clipboard in the background.</p></div>
   <div class="metric"><strong>{{ items.len() }}</strong><span>recent items</span></div>
 </section>
+<aside class="storage-warning" data-storage-warning hidden role="status">
+  <div><strong>Storage is running low.</strong><span>Large uploads may be paused until space is reclaimed.</span></div>
+  <a class="button" href="/storage">Review storage</a>
+</aside>
 <section class="capture-grid">
   <form action="/capture" method="post" class="panel composer">
     <div class="panel-heading"><h2>Paste something</h2><span>Manual capture</span></div>
@@ -29,13 +34,20 @@
     </div>
     <button class="button primary" type="submit">Save to vault</button>
   </form>
-  <form action="/api/v1/items" method="post" enctype="multipart/form-data" class="panel uploader" data-upload-form>
+  <form action="/api/v1/items" method="post" enctype="multipart/form-data" class="panel uploader" data-upload-form data-max-upload-mb="{{ max_upload_mb }}">
     <div class="panel-heading"><h2>Upload a file</h2><span>Up to {{ max_upload_mb }} MB</span></div>
     <label class="dropzone" data-dropzone><input type="file" name="file" required><strong>Drop any file here</strong><span>or choose a file</span></label>
     <label>Virtual folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
     <label>Tags<input name="tags" placeholder="report, monthly"></label>
-    <button class="button" type="submit">Upload file</button>
-    <progress data-upload-progress max="100" value="0" hidden></progress>
+    <button class="button" type="submit" data-upload-start>Upload file</button>
+    <progress data-upload-progress max="100" value="0" hidden aria-label="Upload progress"></progress>
+    <p class="upload-status" data-upload-status aria-live="polite"></p>
+    <div class="upload-controls" data-upload-controls hidden>
+      <button class="button small" type="button" data-upload-pause>Pause</button>
+      <button class="button small" type="button" data-upload-resume hidden>Resume</button>
+      <button class="button small" type="button" data-upload-retry hidden>Retry</button>
+      <button class="button small danger" type="button" data-upload-cancel>Cancel</button>
+    </div>
   </form>
 </section>
 <section class="items-section">
@@ -50,11 +62,23 @@
         {% match item.text_payload %}{% when Some with (payload) %}{% if item.kind == "html" %}<iframe class="html-preview" sandbox="" referrerpolicy="no-referrer" srcdoc="{{ payload }}" title="Sandboxed HTML preview"></iframe><details><summary>View escaped source</summary><pre>{{ payload }}</pre></details>{% else %}<pre>{{ payload }}</pre>{% endif %}{% when None %}<a class="file-link" href="/api/v1/items/{{ item.id }}/content">{{ item.original_filename.as_deref().unwrap_or("Download file") }}</a>{% endmatch %}
       </div>
       <div class="item-actions">
-        {% match item.text_payload %}{% when Some with (payload) %}<button class="icon-button" type="button" data-copy-value="{{ payload }}">Copy</button>{% when None %}{% endmatch %}
+        {% match item.text_payload %}{% when Some with (payload) %}<button class="icon-button" type="button" data-copy-value="{{ payload }}">Copy</button>{% when None %}
+        <button class="icon-button" type="button" data-preview-id="{{ item.id }}" data-preview-kind="{{ item.kind }}" data-preview-size="{{ item.size_bytes }}" data-preview-name="{{ item.original_filename.as_deref().unwrap_or("File preview") }}">Preview</button>
+        <a class="icon-button" href="/api/v1/items/{{ item.id }}/content?download=1" download>Download</a>{% endmatch %}
         <button class="icon-button danger" type="button" data-delete-id="{{ item.id }}">Delete</button>
       </div>
     </article>
     {% endfor %}
   </div>
 </section>
+<dialog class="preview-dialog" data-preview-dialog aria-labelledby="preview-title">
+  <div class="preview-shell">
+    <header class="preview-header">
+      <div><h2 id="preview-title" data-preview-title>File preview</h2><p data-preview-meta></p></div>
+      <div class="preview-actions"><a class="button" data-preview-download download>Download</a><button class="button" type="button" data-preview-close aria-label="Close preview">Close</button></div>
+    </header>
+    <nav class="preview-tabs" data-preview-tabs hidden aria-label="Preview mode"><button type="button" data-preview-tab="rendered" aria-selected="true">Rendered</button><button type="button" data-preview-tab="source" aria-selected="false">Source</button></nav>
+    <div class="preview-body" data-preview-body></div>
+  </div>
+</dialog>
 {% endblock %}

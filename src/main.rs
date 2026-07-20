@@ -39,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
         .context("bind HTTP listener")?;
     info!(%address, "Clipboard Vault Rust service started");
 
-    axum::serve(listener, build_router(AppState::new(&config, pool)))
+    let state = AppState::new(&config, pool);
+    tokio::spawn(clipboard_vault::uploads::maintenance_worker(state.clone()));
+    axum::serve(listener, build_router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve HTTP")?;

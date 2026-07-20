@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use askama::Template;
 use axum::{
     Form,
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
@@ -17,7 +18,7 @@ use crate::{
     AppState, api,
     auth::workspace_cookie,
     error::{AppError, AppResult},
-    models::{BridgeSession, ItemCreate, ItemRow},
+    models::{AuthContext, BridgeSession, ItemCreate, ItemRow},
 };
 
 #[derive(Template)]
@@ -70,6 +71,7 @@ struct KeysTemplate {
     keys: Vec<ApiKeySummary>,
     members: Vec<WorkspaceMember>,
     max_upload_mb: u64,
+    server_max_upload_mb: u64,
     can_manage: bool,
     is_owner: bool,
 }
@@ -111,6 +113,18 @@ struct AdminUsers {
 #[template(path = "admin.html")]
 struct AdminTemplate {
     users: Vec<AdminUser>,
+}
+
+#[derive(Template)]
+#[template(path = "storage.html")]
+pub struct StorageTemplate {
+    pub workspace_name: String,
+    pub free_bytes: u64,
+    pub reserve_bytes: u64,
+    pub workspace_bytes: i64,
+    pub reclaimable_bytes: i64,
+    pub low_storage: bool,
+    pub cleanup_items: Vec<api::StorageCleanupItem>,
 }
 
 #[derive(Template)]
@@ -226,7 +240,7 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> App
     .bind(&organization_id)
     .fetch_optional(&state.pool)
     .await?
-    .unwrap_or(26_214_400) as u64;
+    .unwrap_or(104_857_600) as u64;
     Ok(render(DashboardTemplate {
         session,
         active_workspace_name: workspace_name,
@@ -269,10 +283,72 @@ pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResul
         keys: list.keys,
         members: details.members,
         max_upload_mb: details.max_upload_bytes.min(state.server_max_upload_bytes) / 1024 / 1024,
+        server_max_upload_mb: state.server_max_upload_bytes / 1024 / 1024,
         can_manage,
         is_owner,
     })?
     .into_response())
+}
+
+pub async fn storage_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let session = approved_session(&state, &headers).await?;
+    let auth = page_auth_context(&session)?;
+    api::require_workspace_manager(&auth)?;
+    let details = api::storage_details(&state, &auth).await?;
+    Ok(render(StorageTemplate {
+        workspace_name: details.workspace_name,
+        free_bytes: details.free_bytes,
+        reserve_bytes: details.reserve_bytes,
+        workspace_bytes: details.workspace_bytes,
+        reclaimable_bytes: details.reclaimable_bytes,
+        low_storage: details.low_storage,
+        cleanup_items: details.items,
+    })?
+    .into_response())
+}
+
+pub async fn storage_purge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Redirect> {
+    let session = approved_session(&state, &headers).await?;
+    api::require_same_origin(&state, &headers)?;
+    let auth = page_auth_context(&session)?;
+    let mut item_ids = Vec::new();
+    let mut confirmation = String::new();
+    for (name, value) in url::form_urlencoded::parse(&body) {
+        match name.as_ref() {
+            "item_ids" => item_ids.push(
+                value
+                    .parse::<Uuid>()
+                    .map_err(|_| AppError::Validation("invalid cleanup item".into()))?,
+            ),
+            "confirmation" => confirmation = value.into_owned(),
+            _ => {}
+        }
+    }
+    api::purge_items(&state, &auth, item_ids, &confirmation).await?;
+    Ok(Redirect::to("/storage"))
+}
+
+fn page_auth_context(session: &BridgeSession) -> AppResult<AuthContext> {
+    Ok(AuthContext {
+        user_id: Some(session.user.id.clone()),
+        api_key_id: None,
+        organization_id: session
+            .active_organization_id
+            .clone()
+            .ok_or(AppError::Forbidden)?,
+        role: session
+            .active_role
+            .clone()
+            .unwrap_or_else(|| "member".into()),
+        is_global_admin: session.user.role.split(',').any(|role| role == "admin"),
+    })
 }
 
 pub async fn admin(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
@@ -444,6 +520,12 @@ pub async fn delete_workspace(
         return Err(AppError::Forbidden);
     }
     let organization_id = session.active_organization_id.ok_or(AppError::Forbidden)?;
+    let temp_storage_keys = sqlx::query_scalar::<_, String>(
+        "SELECT temp_storage_key FROM vault_upload_sessions WHERE organization_id=$1",
+    )
+    .bind(&organization_id)
+    .fetch_all(&state.pool)
+    .await?;
     let body = json!({
         "organizationId": organization_id,
         "requesterId": &session.user.id,
@@ -453,7 +535,7 @@ pub async fn delete_workspace(
         .auth
         .post_json("/internal/workspaces/delete", &body, &[])
         .await?;
-    for storage_key in result.storage_keys {
+    for storage_key in result.storage_keys.into_iter().chain(temp_storage_keys) {
         let path = std::path::Path::new(&storage_key);
         if path
             .components()

@@ -16,8 +16,14 @@ Security fixes are applied to the latest release on the default branch.
 - First-admin setup requires a private token and closes permanently after use.
 - Invitation tokens are random, stored only as SHA-256 hashes, expire, and work once.
 - User filenames and virtual paths never become operating-system storage paths.
-- File responses use nosniff and potentially active formats download as attachments.
-- Uploaded content is never executed by Clipboard Vault.
+- File responses use `nosniff`; download disposition is available for every format.
+- Preview type is verified from content. SVG is inert source, HTML and Markdown are sanitized,
+  and uploaded content is never executed by Clipboard Vault.
+- Preview, content, and Tus routes reauthorize every request and remain workspace scoped.
+- Tus chunks are sequential and offset checked; sessions expire and temporary paths are
+  server generated. A completed file is hashed and classified before becoming a vault item.
+- New and resumed uploads reserve their outstanding bytes and stop before the configured disk
+  reserve. Low disk never triggers automatic deletion.
 - Secrets are read from `.env` and excluded from Git.
 
 Password accounts do not prove ownership of their email address because this deployment does
@@ -35,4 +41,4 @@ repository owner privately with:
 - Any suggested mitigation.
 
 Rotate exposed API keys and deployment secrets immediately. If PostgreSQL or file volumes may
-have been accessed, preserve logs, take a backup, and treat stored vault content as compromised.
+have been accessed, preserve logs and treat stored vault content as compromised.
