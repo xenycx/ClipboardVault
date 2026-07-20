@@ -1032,7 +1032,7 @@ pub(crate) async fn purge_items(
     }
     tx.commit().await?;
     for key in storage_keys {
-        if let Ok(path) = checked_blob_path(&state, &key)
+        if let Ok(path) = checked_blob_path(state, &key)
             && let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
