@@ -132,7 +132,7 @@ async fn create_file_item(
         .execute(&mut *tx)
         .await?;
     let outstanding = sqlx::query_scalar::<_, i64>(
-        "SELECT coalesce(sum(expected_bytes - acknowledged_bytes), 0) FROM vault_upload_sessions WHERE state = 'uploading' AND expires_at > now()",
+        "SELECT least(coalesce(sum(expected_bytes - acknowledged_bytes), 0), 9223372036854775807)::bigint FROM vault_upload_sessions WHERE state = 'uploading' AND expires_at > now()",
     )
     .fetch_one(&mut *tx)
     .await?
@@ -888,7 +888,7 @@ pub(crate) async fn storage_details(
     .fetch_one(&state.pool)
     .await?;
     let reserved_upload_bytes = sqlx::query_scalar::<_, i64>(
-        "SELECT coalesce(sum(expected_bytes-acknowledged_bytes),0) FROM vault_upload_sessions WHERE organization_id=$1 AND state='uploading' AND expires_at>now()",
+        "SELECT least(coalesce(sum(expected_bytes-acknowledged_bytes),0), 9223372036854775807)::bigint FROM vault_upload_sessions WHERE organization_id=$1 AND state='uploading' AND expires_at>now()",
     )
     .bind(&auth.organization_id)
     .fetch_one(&state.pool)

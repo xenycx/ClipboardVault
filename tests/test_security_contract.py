@@ -124,6 +124,14 @@ def test_browser_discovers_chunk_limit_and_cleanup_checks_origin() -> None:
     assert "api::require_same_origin(&state, &headers)" in pages
 
 
+def test_upload_reservation_sums_decode_as_bigint() -> None:
+    source = "\n".join(
+        (ROOT / "src" / name).read_text(encoding="utf-8")
+        for name in ("api.rs", "uploads.rs")
+    )
+    assert source.count("9223372036854775807)::bigint") == 4
+
+
 def test_removed_backup_workflow_is_not_referenced() -> None:
     assert not (ROOT / "scripts" / "backup.sh").exists()
     for name in ("README.md", "DEPLOYMENT.md"):
