@@ -7,6 +7,10 @@
   <title>{% block title %}Clipboard Vault{% endblock %}</title>
   <meta name="description" content="A fast private workspace for pasted content and files.">
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/vendor/highlight-github-dark.min.css">
+  <script src="/static/vendor/highlight.min.js" defer></script>
+  <script src="/static/vendor/marked.umd.js" defer></script>
+  <script src="/static/vendor/purify.min.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -18,4 +22,3 @@
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>
 </html>
-

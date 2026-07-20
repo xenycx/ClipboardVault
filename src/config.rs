@@ -12,6 +12,10 @@ pub struct Config {
     pub auth_internal_url: String,
     pub auth_bridge_secret: String,
     pub server_max_upload_bytes: u64,
+    pub legacy_max_upload_bytes: u64,
+    pub upload_disk_reserve_bytes: u64,
+    pub tus_chunk_size_bytes: u64,
+    pub tus_session_ttl_seconds: u64,
 }
 
 impl Config {
@@ -20,7 +24,7 @@ impl Config {
         if auth_bridge_secret.len() < 32 {
             bail!("AUTH_BRIDGE_SECRET must contain at least 32 characters");
         }
-        Ok(Self {
+        let config = Self {
             port: parse("PORT", 8080)?,
             database_url: required("DATABASE_URL")?,
             database_max_connections: parse("DATABASE_MAX_CONNECTIONS", 20)?,
@@ -36,8 +40,35 @@ impl Config {
                 .trim_end_matches('/')
                 .to_owned(),
             auth_bridge_secret,
-            server_max_upload_bytes: parse("SERVER_MAX_UPLOAD_BYTES", 104_857_600)?,
-        })
+            server_max_upload_bytes: parse("SERVER_MAX_UPLOAD_BYTES", 10_737_418_240)?,
+            legacy_max_upload_bytes: parse("LEGACY_MAX_UPLOAD_BYTES", 104_857_600)?,
+            upload_disk_reserve_bytes: parse("UPLOAD_DISK_RESERVE_BYTES", 21_474_836_480)?,
+            tus_chunk_size_bytes: parse("TUS_CHUNK_SIZE_BYTES", 16_777_216)?,
+            tus_session_ttl_seconds: parse("TUS_SESSION_TTL_SECONDS", 604_800)?,
+        };
+        if config.server_max_upload_bytes == 0 || config.server_max_upload_bytes > i64::MAX as u64 {
+            bail!("SERVER_MAX_UPLOAD_BYTES must be between 1 and {}", i64::MAX);
+        }
+        if config.legacy_max_upload_bytes == 0
+            || config.legacy_max_upload_bytes > config.server_max_upload_bytes
+            || config.legacy_max_upload_bytes.saturating_add(1024 * 1024) > usize::MAX as u64
+        {
+            bail!(
+                "LEGACY_MAX_UPLOAD_BYTES must fit the request platform and not exceed the server maximum"
+            );
+        }
+        if config.tus_chunk_size_bytes == 0
+            || config.tus_chunk_size_bytes > config.legacy_max_upload_bytes
+            || config.tus_chunk_size_bytes > usize::MAX as u64
+        {
+            bail!(
+                "TUS_CHUNK_SIZE_BYTES must be positive, fit memory, and not exceed the legacy request limit"
+            );
+        }
+        if config.tus_session_ttl_seconds == 0 || config.tus_session_ttl_seconds > i64::MAX as u64 {
+            bail!("TUS_SESSION_TTL_SECONDS is outside the supported range");
+        }
+        Ok(config)
     }
 }
 

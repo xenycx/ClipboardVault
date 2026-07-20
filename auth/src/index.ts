@@ -238,7 +238,7 @@ app.get("/internal/workspaces/details", async (c) => {
   );
   return c.json(data({
     members: ["owner", "admin"].includes(role) ? members.rows : members.rows.filter((row) => row.id === requesterId),
-    maxUploadBytes: Number(settings.rows[0]?.maxUploadBytes || 26214400),
+    maxUploadBytes: Number(settings.rows[0]?.maxUploadBytes || 104857600),
   }));
 });
 

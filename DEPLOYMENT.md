@@ -60,7 +60,13 @@ Edit `.env`:
 - `BETTER_AUTH_SECRET`, `AUTH_BRIDGE_SECRET`, and
   `BOOTSTRAP_TOKEN`: three different random values.
 - Google client ID and secret from Google Cloud.
-- Upload limits if the 100 MB server and 25 MB workspace defaults are unsuitable.
+- Upload limits if the 10 GiB deployment ceiling, 100 MiB workspace default, 16 MiB Tus
+  chunks, seven-day session expiry, or 20 GiB disk reserve are unsuitable.
+
+`SERVER_MAX_UPLOAD_BYTES` is the absolute per-file ceiling. Keep
+`LEGACY_MAX_UPLOAD_BYTES` at 100 MiB for the multipart compatibility endpoint and use Tus for
+larger files. `UPLOAD_DISK_RESERVE_BYTES` protects the VPS from being filled by uploads; the
+vault volume must have more free space than the reserve plus the file being uploaded.
 
 Generate each secret separately:
 
@@ -126,63 +132,38 @@ curl -fsS https://vault.example.com/health/live
 curl -fsS https://vault.example.com/health/ready
 ```
 
-### Backups
+### Storage pressure and cleanup
 
-Load the environment and run:
+The application reserves 20 GiB of free space by default. If an upload would cross that
+boundary it returns `507 Insufficient Storage`; login, previews, downloads, and cleanup remain
+available. Do not reduce the reserve without accounting for PostgreSQL, container images,
+logs, and operating-system updates on the same filesystem.
 
-```bash
-set -a
-. ./.env
-set +a
-./scripts/backup.sh
-```
+Workspace owners and admins can review reserved bytes plus the oldest and largest items in
+the storage screen. Purging requires explicit selection and workspace-name confirmation.
+No age-based or low-space process deletes vault data automatically.
 
-Each backup contains a PostgreSQL custom-format dump, a compressed file-volume archive, and
-SHA-256 checksums. Copy backups off the VPS. Recommended schedule is every six hours with
-30 days of local retention and daily offsite copies.
-
-Verify a backup before relying on it:
-
-```bash
-cd backups/<timestamp>
-sha256sum -c SHA256SUMS
-pg_restore --list database.dump >/dev/null
-tar -tzf files.tar.gz >/dev/null
-```
-
-### Restore
-
-Stop writes and preserve the current volumes first:
-
-```bash
-docker compose stop vault auth nginx
-docker compose up -d postgres
-cat backups/<timestamp>/database.dump | docker compose exec -T postgres \
-  pg_restore --clean --if-exists -U vault -d clipboard_vault
-docker run --rm -v clipboard-vault_vault-files:/restore \
-  -v "$PWD/backups/<timestamp>:/backup:ro" alpine \
-  sh -c 'rm -rf /restore/* && tar -xzf /backup/files.tar.gz -C /restore'
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-```
-
-Test login, item listing, and one file download after restoring.
+Permanent purge is irreversible, and a code rollback cannot recover deleted PostgreSQL
+rows or file bytes.
 
 ### Upgrade
 
 ```bash
-./scripts/backup.sh
 git fetch --all --prune
 git checkout <tested-tag-or-commit>
 docker compose -f docker-compose.yml -f docker-compose.prod.yml build --pull
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-Review release notes and committed migrations before upgrading.
+Before upgrading, record the running commit and verify that the upload volume has more than
+the configured reserve available. Review release notes and committed migrations. After the
+restart, verify both health routes, resume an interrupted upload, and smoke-test text, image,
+PDF preview, ranged download, and explicit cleanup.
 
 ### Rollback
 
-Checkout the previous tested commit and rebuild. If the release changed the database in an
-incompatible way, restore the pre-upgrade database and file backup together.
+Checkout the previous tested commit and rebuild the services. This rolls back application
+code only; it cannot undo a destructive data operation or an incompatible migration.
 
 ## Troubleshooting
 
@@ -190,8 +171,14 @@ incompatible way, restore the pre-upgrade database and file backup together.
   character and confirm `PUBLIC_BASE_URL` uses HTTPS.
 - Site is pending forever: the first admin must claim `/setup`; later accounts are
   approved at `/admin`.
-- Upload returns 413: raise both `SERVER_MAX_UPLOAD_BYTES` and
-  `NGINX_CLIENT_MAX_BODY_SIZE`, then restart Nginx and Rust.
+- Multipart upload returns 413: confirm it is no larger than `LEGACY_MAX_UPLOAD_BYTES` and
+  `NGINX_LEGACY_CLIENT_MAX_BODY_SIZE`; use resumable upload for larger files.
+- Tus chunk returns 413: keep client chunks at or below `TUS_CHUNK_SIZE_BYTES` and confirm
+  `NGINX_TUS_CLIENT_MAX_BODY_SIZE` allows the chunk plus protocol overhead.
+- Upload returns 507: free space through explicit workspace cleanup or increase VPS storage;
+  do not bypass `UPLOAD_DISK_RESERVE_BYTES` without measuring available capacity.
+- Upload is interrupted: reselect the same file in the browser or reuse its Tus URL with the
+  resumable Python example; the server `HEAD` offset is authoritative.
 - Authentication service unhealthy: inspect `docker compose logs auth` and verify all
   three secrets and PostgreSQL credentials.
 - Certificate request fails: confirm DNS, ports 80/443, firewall rules, and that no other service

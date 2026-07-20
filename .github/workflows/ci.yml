@@ -80,6 +80,13 @@ jobs:
           cp .env.example .env
           sed -i 's|DOMAIN=vault.example.com|DOMAIN=localhost|' .env
           sed -i 's|PUBLIC_BASE_URL=https://vault.example.com|PUBLIC_BASE_URL=http://localhost|' .env
+          sed -i 's|SERVER_MAX_UPLOAD_BYTES=10737418240|SERVER_MAX_UPLOAD_BYTES=67108864|' .env
+          sed -i 's|LEGACY_MAX_UPLOAD_BYTES=104857600|LEGACY_MAX_UPLOAD_BYTES=8388608|' .env
+          sed -i 's|TUS_CHUNK_SIZE_BYTES=16777216|TUS_CHUNK_SIZE_BYTES=1048576|' .env
+          sed -i 's|TUS_SESSION_TTL_SECONDS=604800|TUS_SESSION_TTL_SECONDS=300|' .env
+          sed -i 's|UPLOAD_DISK_RESERVE_BYTES=21474836480|UPLOAD_DISK_RESERVE_BYTES=1048576|' .env
+          sed -i 's|NGINX_LEGACY_CLIENT_MAX_BODY_SIZE=101m|NGINX_LEGACY_CLIENT_MAX_BODY_SIZE=9m|' .env
+          sed -i 's|NGINX_TUS_CLIENT_MAX_BODY_SIZE=17m|NGINX_TUS_CLIENT_MAX_BODY_SIZE=2m|' .env
       - name: Build and start the stack
         run: docker compose up -d --build
       - name: Wait for readiness
@@ -110,6 +117,63 @@ jobs:
           printf 'integration upload\n' > integration.txt
           python examples/upload_file.py integration.txt --server http://localhost --api-key "$(cat api-key.txt)" --path /ci --tag integration
           curl -fsS -H "X-API-Key: $(cat api-key.txt)" 'http://localhost/api/v1/items?tag=integration' | jq -e '.items | length == 1'
+      - name: Test resumable upload and ranged read
+        run: |
+          dd if=/dev/zero of=resumable.bin bs=1048576 count=3 status=none
+          printf 'final partial chunk' >> resumable.bin
+          upload_size=$(wc -c < resumable.bin)
+          metadata="filename $(printf resumable.bin | base64 -w0),virtualPath $(printf /ci | base64 -w0),tags $(printf '[\"resumable\"]' | base64 -w0)"
+          curl -fsS -D upload-headers.txt -o /dev/null -X POST \
+            -H "X-API-Key: $(cat api-key.txt)" -H 'Tus-Resumable: 1.0.0' \
+            -H "Upload-Length: $upload_size" -H "Upload-Metadata: $metadata" \
+            http://localhost/api/v1/uploads
+          upload_url=$(awk 'tolower($1)=="location:" {gsub("\\r", "", $2); print $2}' upload-headers.txt)
+          test -n "$upload_url"
+          head -c 1048576 resumable.bin | curl -fsS -o /dev/null -X PATCH \
+            -H "X-API-Key: $(cat api-key.txt)" -H 'Tus-Resumable: 1.0.0' \
+            -H 'Upload-Offset: 0' -H 'Content-Type: application/offset+octet-stream' \
+            --data-binary @- "$upload_url"
+          python examples/upload_resumable.py resumable.bin --server http://localhost --api-key "$(cat api-key.txt)" --upload-url "$upload_url" --chunk-mib 1
+          item_id=$(curl -fsS -H "X-API-Key: $(cat api-key.txt)" 'http://localhost/api/v1/items?tag=resumable' | jq -er '.items[0].id')
+          test -n "$item_id"
+          status=$(curl -sS -o ranged.bin -w '%{http_code}' -H "X-API-Key: $(cat api-key.txt)" -H 'Range: bytes=1048576-2097151' "http://localhost/api/v1/items/$item_id/content")
+          test "$status" = 206
+          test "$(wc -c < ranged.bin)" = 1048576
+          curl -fsS -X DELETE -H "X-API-Key: $(cat api-key.txt)" "http://localhost/api/v1/items/$item_id"
+          storage=$(curl -fsS -b cookies.txt http://localhost/api/v1/storage)
+          echo "$storage" | jq -e --arg id "$item_id" '.reserveBytes == 1048576 and any(.items[]; .id == $id and .deleted)'
+          workspace_name=$(echo "$storage" | jq -er '.workspaceName')
+          purge_body=$(jq -nc --arg id "$item_id" --arg confirmation "$workspace_name" '{itemIds:[$id],confirmation:$confirmation}')
+          curl -fsS -X POST -b cookies.txt -H 'Origin: http://localhost' -H 'Content-Type: application/json' -d "$purge_body" http://localhost/api/v1/storage/purge | jq -e '.purged == 1'
+      - name: Test text preview and forced download
+        run: |
+          item_id=$(curl -fsS -H "X-API-Key: $(cat api-key.txt)" 'http://localhost/api/v1/items?tag=integration' | jq -er '.items[0].id')
+          curl -fsSI -H "X-API-Key: $(cat api-key.txt)" "http://localhost/api/v1/items/$item_id/preview" | grep -qi '^X-Preview-Kind: text'
+          curl -fsSI -H "X-API-Key: $(cat api-key.txt)" "http://localhost/api/v1/items/$item_id/content?download=1" | grep -qi '^Content-Disposition: attachment'
+      - name: Test low-disk upload rejection
+        run: |
+          sed -i 's|UPLOAD_DISK_RESERVE_BYTES=1048576|UPLOAD_DISK_RESERVE_BYTES=18446744073709551615|' .env
+          docker compose up -d --force-recreate vault
+          ready=false
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost/health/ready; then ready=true; break; fi
+            sleep 2
+          done
+          test "$ready" = true
+          status=$(curl -sS -o low-disk.json -w '%{http_code}' -X POST \
+            -H "X-API-Key: $(cat api-key.txt)" -H 'Tus-Resumable: 1.0.0' \
+            -H 'Upload-Length: 1' -H 'Upload-Metadata: filename bG93LWRpc2sudHh0' \
+            http://localhost/api/v1/uploads)
+          test "$status" = 507
+          jq -e '.error.code == "INSUFFICIENT_STORAGE"' low-disk.json
+          legacy_status=$(curl -sS -o legacy-low-disk.json -w '%{http_code}' -X POST \
+            -H "X-API-Key: $(cat api-key.txt)" -F 'file=@integration.txt' \
+            http://localhost/api/v1/items)
+          test "$legacy_status" = 507
+          jq -e '.error.code == "INSUFFICIENT_STORAGE"' legacy-low-disk.json
+          item_id=$(curl -fsS -H "X-API-Key: $(cat api-key.txt)" 'http://localhost/api/v1/items?tag=integration' | jq -er '.items[0].id')
+          curl -fsSI -H "X-API-Key: $(cat api-key.txt)" "http://localhost/api/v1/items/$item_id/preview" | grep -qi '^X-Preview-Kind: text'
+          curl -fsSI -H "X-API-Key: $(cat api-key.txt)" "http://localhost/api/v1/items/$item_id/content?download=1" | grep -qi '^Content-Disposition: attachment'
       - name: Show logs on failure
         if: failure()
         run: docker compose logs

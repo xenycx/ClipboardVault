@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Keys and team · Clipboard Vault{% endblock %}
-{% block nav %}<nav class="nav"><a href="/">Vault</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
+{% block nav %}<nav class="nav"><a href="/">Vault</a><a href="/storage">Storage</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
 {% block content %}
 <section class="page-heading"><span class="eyebrow">{{ workspace_name }}</span><h1>Automation and access</h1><p>Keys are tied to this workspace. The complete key is shown only once.</p></section>
 <div class="two-column">
@@ -17,7 +17,7 @@
 </div>
 {% if can_manage %}
 <section class="panel"><div class="panel-heading"><h2>Workspace settings</h2><span>Server maximum applies</span></div>
-  <form action="/workspaces/settings" method="post" class="inline-form"><label>Maximum upload (MB)<input type="number" name="max_upload_mb" min="1" value="{{ max_upload_mb }}" required></label><button class="button" type="submit">Save limit</button></form>
+  <form action="/workspaces/settings" method="post" class="inline-form"><label>Maximum upload (MB)<input type="number" name="max_upload_mb" min="1" max="{{ server_max_upload_mb }}" value="{{ max_upload_mb }}" required><span class="muted">Up to {{ server_max_upload_mb }} MiB</span></label><button class="button" type="submit">Save limit</button></form>
 </section>
 <section class="panel table-panel"><div class="panel-heading"><h2>Members</h2><span>{{ members.len() }} people</span></div><div class="table-wrap"><table><thead><tr><th>Person</th><th>Role</th><th>Joined</th><th>Actions</th></tr></thead><tbody>
   {% for member in members %}<tr><td><strong>{{ member.name }}</strong><br><span class="muted">{{ member.email }}</span></td><td>{{ member.role }}</td><td>{{ member.created_at }}</td><td class="actions-cell">

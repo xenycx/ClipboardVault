@@ -5,6 +5,7 @@ pub mod error;
 pub mod models;
 pub mod pages;
 pub mod storage;
+pub mod uploads;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -33,6 +34,10 @@ pub struct AppState {
     pub upload_root: Arc<PathBuf>,
     pub public_base_url: Arc<String>,
     pub server_max_upload_bytes: u64,
+    pub legacy_max_upload_bytes: u64,
+    pub upload_disk_reserve_bytes: u64,
+    pub tus_chunk_size_bytes: u64,
+    pub tus_session_ttl_seconds: u64,
 }
 
 impl AppState {
@@ -43,6 +48,10 @@ impl AppState {
             upload_root: Arc::new(config.upload_root.clone()),
             public_base_url: Arc::new(config.public_base_url.clone()),
             server_max_upload_bytes: config.server_max_upload_bytes,
+            legacy_max_upload_bytes: config.legacy_max_upload_bytes,
+            upload_disk_reserve_bytes: config.upload_disk_reserve_bytes,
+            tus_chunk_size_bytes: config.tus_chunk_size_bytes,
+            tus_session_ttl_seconds: config.tus_session_ttl_seconds,
         }
     }
 }
@@ -50,7 +59,7 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let request_id = HeaderName::from_static("x-request-id");
     let max_body = state
-        .server_max_upload_bytes
+        .legacy_max_upload_bytes
         .saturating_add(1024 * 1024)
         .min(usize::MAX as u64) as usize;
 
@@ -61,6 +70,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/setup", get(pages::setup))
         .route("/admin", get(pages::admin))
         .route("/keys", get(pages::keys))
+        .route("/storage", get(pages::storage_page))
+        .route("/storage/purge", post(pages::storage_purge))
         .route("/reset-password", get(pages::reset_password))
         .route("/join/{token}", get(pages::join).post(pages::redeem_invite))
         .route("/workspaces/switch", post(pages::switch_workspace))
@@ -97,7 +108,28 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/items/{id}/restore", post(api::restore_item))
         .route("/api/v1/items/{id}/purge", post(api::purge_item))
-        .route("/api/v1/items/{id}/content", get(api::download_content))
+        .route(
+            "/api/v1/items/{id}/content",
+            get(api::download_content).head(api::download_content),
+        )
+        .route(
+            "/api/v1/items/{id}/preview",
+            get(api::preview_content).head(api::preview_content),
+        )
+        .route(
+            "/api/v1/uploads",
+            post(uploads::create_upload).options(uploads::upload_options),
+        )
+        .route(
+            "/api/v1/uploads/{id}",
+            get(uploads::upload_status)
+                .head(uploads::head_upload)
+                .patch(uploads::patch_upload)
+                .delete(uploads::cancel_upload),
+        )
+        .route("/api/v1/uploads/{id}/status", get(uploads::upload_status))
+        .route("/api/v1/storage", get(api::storage_status))
+        .route("/api/v1/storage/purge", post(api::bulk_purge))
         .route("/api/v1/items/export", get(api::export_items))
         .route("/api/v1/tags", get(api::list_tags))
         .route("/health/live", get(api::live))
@@ -122,10 +154,15 @@ async fn security_headers(
     request
         .headers_mut()
         .remove("oai-authenticated-user-full-name");
+    let preview = request.uri().path().ends_with("/preview");
+    let tus = request.uri().path().starts_with("/api/v1/uploads");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    headers.insert(
+        "x-frame-options",
+        if preview { "SAMEORIGIN" } else { "DENY" }.parse().unwrap(),
+    );
     headers.insert(
         "referrer-policy",
         "strict-origin-when-cross-origin".parse().unwrap(),
@@ -142,5 +179,8 @@ async fn security_headers(
             .parse()
             .unwrap(),
     );
+    if tus {
+        headers.insert("tus-resumable", "1.0.0".parse().unwrap());
+    }
     response
 }

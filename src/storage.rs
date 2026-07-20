@@ -272,7 +272,7 @@ pub fn file_kind(mime: &str) -> &'static str {
     }
 }
 
-fn safe_filename(value: &str) -> String {
+pub(crate) fn safe_filename(value: &str) -> String {
     value
         .rsplit(['/', '\\'])
         .next()
@@ -298,7 +298,7 @@ fn safe_component(value: &str) -> String {
         .collect()
 }
 
-fn sniff_mime(signature: &[u8], filename: &str, declared: Option<&str>) -> String {
+pub(crate) fn sniff_mime(signature: &[u8], filename: &str, declared: Option<&str>) -> String {
     let magic = if signature.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if signature.starts_with(b"\xff\xd8\xff") {
