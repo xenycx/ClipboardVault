@@ -394,11 +394,12 @@ pub async fn purge_item(
         .await?;
     let mut remove_storage = None;
     if let Some(blob_id) = blob.0 {
-        let references =
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vault_items WHERE blob_id = $1")
-                .bind(blob_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let references = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM vault_items WHERE blob_id = $1",
+        )
+        .bind(blob_id)
+        .fetch_one(&mut *tx)
+        .await?;
         if references == 0 {
             sqlx::query("DELETE FROM vault_blobs WHERE id = $1")
                 .bind(blob_id)
@@ -882,7 +883,7 @@ pub(crate) async fn storage_details(
             .fetch_one(&state.pool)
             .await?;
     let workspace_bytes = sqlx::query_scalar::<_, i64>(
-        "SELECT coalesce(sum(size_bytes),0) FROM vault_blobs WHERE organization_id=$1",
+        "SELECT least(coalesce(sum(size_bytes), 0), 9223372036854775807)::bigint FROM vault_blobs WHERE organization_id=$1",
     )
     .bind(&auth.organization_id)
     .fetch_one(&state.pool)
@@ -1012,11 +1013,12 @@ pub(crate) async fn purge_items(
         if !seen_blobs.insert(blob_id) {
             continue;
         }
-        let references =
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vault_items WHERE blob_id=$1")
-                .bind(blob_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let references = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM vault_items WHERE blob_id=$1",
+        )
+        .bind(blob_id)
+        .fetch_one(&mut *tx)
+        .await?;
         if references == 0 {
             let size = sqlx::query_scalar::<_, i64>(
                 "DELETE FROM vault_blobs WHERE id=$1 RETURNING size_bytes",

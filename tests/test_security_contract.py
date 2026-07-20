@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -124,12 +125,28 @@ def test_browser_discovers_chunk_limit_and_cleanup_checks_origin() -> None:
     assert "api::require_same_origin(&state, &headers)" in pages
 
 
-def test_upload_reservation_sums_decode_as_bigint() -> None:
+def test_postgres_aggregates_decoded_as_i64_are_explicit_bigint() -> None:
     source = "\n".join(
-        (ROOT / "src" / name).read_text(encoding="utf-8")
-        for name in ("api.rs", "uploads.rs")
+        path.read_text(encoding="utf-8") for path in sorted((ROOT / "src").glob("*.rs"))
     )
-    assert source.count("9223372036854775807)::bigint") == 4
+    starts = re.findall(r"query_scalar::<_,\s*i64>\(", source)
+    queries = re.findall(
+        r'query_scalar::<_,\s*i64>\(\s*"((?:\\.|[^"\\])*)"\s*,?\s*\)',
+        source,
+        flags=re.DOTALL,
+    )
+    assert len(queries) == len(starts), "all i64 scalar SQL must remain literal and auditable"
+    aggregates = [
+        query
+        for query in queries
+        if re.search(r"\b(?:count|sum|avg|min|max)\s*\(", query, re.IGNORECASE)
+    ]
+    assert aggregates
+    assert not [
+        query
+        for query in aggregates
+        if not re.search(r"::\s*bigint\b|\bas\s+bigint\b", query, re.IGNORECASE)
+    ]
 
 
 def test_removed_backup_workflow_is_not_referenced() -> None:
