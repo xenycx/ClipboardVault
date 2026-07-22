@@ -14,8 +14,8 @@
 {% endblock %}
 {% block content %}
 <section class="hero-row">
-  <div><span class="eyebrow">{{ active_workspace_name }}</span><h1>Your working memory, organized.</h1><p>Paste deliberately or send files with an API key. Nothing reads your clipboard in the background.</p></div>
-  <div class="metric"><strong>{{ items.len() }}</strong><span>recent items</span></div>
+  <div class="hero-copy"><span class="eyebrow">{{ active_workspace_name }}</span><h1>Your working memory.</h1><p>Save text, code, links, and files in one private workspace. Clipboard Vault only stores what you explicitly submit.</p></div>
+  <div class="metric"><span class="metric-dot" aria-hidden="true"></span><div><strong>{{ items.len() }}</strong><span>recent items</span></div></div>
 </section>
 <aside class="storage-warning" data-storage-warning hidden role="status">
   <div><strong>Storage is running low.</strong><span>Large uploads may be paused until space is reclaimed.</span></div>
@@ -23,7 +23,7 @@
 </aside>
 <section class="capture-grid">
   <form action="/capture" method="post" class="panel composer">
-    <div class="panel-heading"><h2>Paste something</h2><span>Manual capture</span></div>
+    <div class="panel-heading"><div><span class="panel-kicker">Quick capture</span><h2>Paste something</h2></div><span>Manual only</span></div>
     <label class="sr-only" for="payload">Content</label>
     <textarea id="payload" name="payload" rows="8" placeholder="Paste text, code, HTML, or a URL…" required></textarea>
     <div class="form-grid">
@@ -35,8 +35,8 @@
     <button class="button primary" type="submit">Save to vault</button>
   </form>
   <form action="/api/v1/items" method="post" enctype="multipart/form-data" class="panel uploader" data-upload-form data-max-upload-mb="{{ max_upload_mb }}">
-    <div class="panel-heading"><h2>Upload a file</h2><span>Up to {{ max_upload_mb }} MB</span></div>
-    <label class="dropzone" data-dropzone><input type="file" name="file" required><strong>Drop any file here</strong><span>or choose a file</span></label>
+    <div class="panel-heading"><div><span class="panel-kicker">File transfer</span><h2>Upload a file</h2></div><span>Up to {{ max_upload_mb }} MB</span></div>
+    <label class="dropzone" data-dropzone><input type="file" name="file" required><span class="dropzone-icon" aria-hidden="true">↑</span><strong>Drop any file here</strong><span>or click to browse</span></label>
     <label>Virtual folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
     <label>Tags<input name="tags" placeholder="report, monthly"></label>
     <button class="button" type="submit" data-upload-start>Upload file</button>
@@ -51,7 +51,7 @@
   </form>
 </section>
 <section class="items-section">
-  <div class="section-heading"><div><span class="eyebrow">LATEST</span><h2>Vault items</h2></div><input type="search" placeholder="Filter this page" data-item-filter aria-label="Filter items"></div>
+  <div class="section-heading"><div><span class="eyebrow">LATEST</span><h2>Vault items</h2></div><label class="filter-field"><span class="sr-only">Filter items</span><input type="search" placeholder="Search this page…" data-item-filter aria-label="Filter items"></label></div>
   <div class="item-list" role="region" aria-live="polite">
     {% if items.is_empty() %}<div class="empty panel"><h3>Your vault is empty</h3><p>Paste content above or upload a file. Clipboard Vault only stores what you explicitly submit.</p></div>{% endif %}
     {% for item in items %}
