@@ -10,6 +10,24 @@
   const HIGHLIGHT_LIMIT = MiB;
   const IMAGE_LIMIT = 50 * MiB;
 
+  const themeToggle = document.querySelector("[data-theme-toggle]");
+  const setTheme = (theme) => {
+    const nextTheme = theme === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = nextTheme;
+    try { localStorage.setItem("clipboard-vault.theme", nextTheme); } catch {}
+    if (themeToggle) {
+      const isLight = nextTheme === "light";
+      themeToggle.setAttribute("aria-label", `Switch to ${isLight ? "dark" : "light"} theme`);
+      themeToggle.setAttribute("aria-pressed", String(isLight));
+    }
+  };
+  if (themeToggle) {
+    setTheme(document.documentElement.dataset.theme);
+    themeToggle.addEventListener("click", () => {
+      setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+    });
+  }
+
   const errorBox = document.querySelector("[data-auth-error]");
   const showError = (message) => { if (errorBox) errorBox.textContent = message || "Something went wrong."; };
   const requestedReturn = new URLSearchParams(window.location.search).get("returnTo") || "/pending";
