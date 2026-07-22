@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { auth, pendingResetTokens, pool, publicBaseURL } from "./auth.js";
+import { providerRegistry } from "./providers.js";
 
 type SessionShape = {
   user: {
@@ -64,6 +65,11 @@ function keyMetadata(value: unknown): Record<string, unknown> {
 
 app.get("/health", async (c) => {
   await pool.query("SELECT 1"); return c.json(data({ status: "ready" }));
+});
+
+app.get("/api/auth/vault/providers", (c) => {
+  c.header("Cache-Control", "no-store");
+  return c.json(data({ providers: providerRegistry.publicProviders }));
 });
 
 app.post("/api/auth/vault/bootstrap", async (c) => {

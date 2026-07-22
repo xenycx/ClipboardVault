@@ -8,6 +8,7 @@ import {
 } from "better-auth/plugins/organization/access";
 import { apiKey } from "@better-auth/api-key";
 import { Pool } from "pg";
+import { providerRegistry } from "./providers.js";
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -15,7 +16,6 @@ export const pool = new Pool({
 });
 
 const baseURL = (process.env.BETTER_AUTH_URL || "http://localhost:8080").replace(/\/$/, "");
-const googleConfigured = Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 export const pendingResetTokens = new Map<string, { token: string; expiresAt: number }>();
 
 const workspaceStatements = {
@@ -56,12 +56,15 @@ export const auth = betterAuth({
       pendingResetTokens.set(user.id, { token, expiresAt: Date.now() + 60_000 });
     },
   },
-  socialProviders: googleConfigured ? {
-    google: {
-      clientId: process.env.GOOGLE_CLIENT_ID!,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+  socialProviders: providerRegistry.socialProviders,
+  account: {
+    accountLinking: {
+      enabled: true,
+      allowDifferentEmails: false,
+      allowUnlinkingAll: false,
+      updateUserInfoOnLink: false,
     },
-  } : {},
+  },
   user: {
     additionalFields: {
       approvalStatus: { type: "string", required: false, defaultValue: "pending", input: false },

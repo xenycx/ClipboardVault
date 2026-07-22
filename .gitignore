@@ -11,6 +11,8 @@
 /.env.production
 /data/
 /uploads/
+/backups/
+/.deployment/
 *.log
 __pycache__/
 *.py[cod]

@@ -1,7 +1,13 @@
 name: CI
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -21,6 +27,22 @@ jobs:
 
   auth:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: clipboard_vault
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault-ci-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U vault -d clipboard_vault"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql://vault:vault-ci-password@127.0.0.1:5432/clipboard_vault
+      BETTER_AUTH_SECRET: auth-ci-secret-with-at-least-32-bytes
     defaults:
       run:
         working-directory: auth
@@ -35,8 +57,14 @@ jobs:
           cache: pnpm
           cache-dependency-path: auth/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      - run: pnpm test
       - run: pnpm build
+      - name: Confirm Better Auth schema has no delta
+        run: |
+          docker exec -i ${{ job.services.postgres.id }} psql -U vault -d clipboard_vault < migrations/auth-schema.sql
+          rm -f migrations/generated.sql
+          pnpm auth:generate
+          test ! -s migrations/generated.sql
 
   contracts:
     runs-on: ubuntu-latest
@@ -50,28 +78,14 @@ jobs:
       - run: cp .env.example .env
       - run: docker compose config --quiet
 
-  images:
-    runs-on: ubuntu-latest
-    needs: [rust, auth, contracts]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          tags: clipboard-vault:ci
-      - uses: docker/build-push-action@v6
-        with:
-          context: auth
-          push: false
-          tags: clipboard-vault-auth:ci
-
   integration:
     runs-on: ubuntu-latest
     needs: [rust, auth, contracts]
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -87,8 +101,30 @@ jobs:
           sed -i 's|UPLOAD_DISK_RESERVE_BYTES=21474836480|UPLOAD_DISK_RESERVE_BYTES=1048576|' .env
           sed -i 's|NGINX_LEGACY_CLIENT_MAX_BODY_SIZE=101m|NGINX_LEGACY_CLIENT_MAX_BODY_SIZE=9m|' .env
           sed -i 's|NGINX_TUS_CLIENT_MAX_BODY_SIZE=17m|NGINX_TUS_CLIENT_MAX_BODY_SIZE=2m|' .env
-      - name: Build and start the stack
-        run: docker compose up -d --build
+          sed -i 's|GOOGLE_CLIENT_ID=|GOOGLE_CLIENT_ID=google-ci-client|' .env
+          sed -i 's|GOOGLE_CLIENT_SECRET=|GOOGLE_CLIENT_SECRET=google-ci-secret|' .env
+          sed -i 's|GITHUB_CLIENT_ID=|GITHUB_CLIENT_ID=github-ci-client|' .env
+          sed -i 's|GITHUB_CLIENT_SECRET=|GITHUB_CLIENT_SECRET=github-ci-secret|' .env
+          sed -i 's|DISCORD_CLIENT_ID=|DISCORD_CLIENT_ID=discord-ci-client|' .env
+          sed -i 's|DISCORD_CLIENT_SECRET=|DISCORD_CLIENT_SECRET=discord-ci-secret|' .env
+      - name: Build and load Rust image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: clipboard-vault:local
+          cache-from: type=gha,scope=clipboard-vault-rust
+          cache-to: type=gha,mode=max,scope=clipboard-vault-rust
+      - name: Build and load auth image
+        uses: docker/build-push-action@v6
+        with:
+          context: auth
+          load: true
+          tags: clipboard-vault-auth:local
+          cache-from: type=gha,scope=clipboard-vault-auth
+          cache-to: type=gha,mode=max,scope=clipboard-vault-auth
+      - name: Start the exact images under test
+        run: docker compose up -d --no-build
       - name: Wait for readiness
         run: |
           for attempt in $(seq 1 60); do
@@ -97,6 +133,16 @@ jobs:
           done
           docker compose logs
           exit 1
+      - name: Test enabled provider discovery and redirects
+        run: |
+          curl -fsS -D provider-headers.txt -o providers.json http://localhost/api/auth/vault/providers
+          grep -qi '^cache-control: no-store' provider-headers.txt
+          jq -e '.data.providers == [{"id":"google","label":"Google"},{"id":"github","label":"GitHub"},{"id":"discord","label":"Discord"}]' providers.json
+          for provider in google github discord; do
+            body=$(jq -nc --arg provider "$provider" '{provider:$provider,callbackURL:"/pending",errorCallbackURL:"/login"}')
+            curl -fsS -H 'Origin: http://localhost' -H 'Content-Type: application/json' \
+              -d "$body" http://localhost/api/auth/sign-in/social | jq -e '.url | startswith("https://")'
+          done
       - name: Bootstrap account and API key
         run: |
           curl -fsS -c cookies.txt -H 'Origin: http://localhost' -H 'Content-Type: application/json' \
@@ -153,7 +199,7 @@ jobs:
       - name: Test low-disk upload rejection
         run: |
           sed -i 's|UPLOAD_DISK_RESERVE_BYTES=1048576|UPLOAD_DISK_RESERVE_BYTES=18446744073709551615|' .env
-          docker compose up -d --force-recreate vault
+          docker compose up -d --no-deps --force-recreate vault
           ready=false
           for attempt in $(seq 1 30); do
             if curl -fsS http://localhost/health/ready; then ready=true; break; fi

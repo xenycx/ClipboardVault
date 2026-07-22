@@ -154,3 +154,53 @@ def test_removed_backup_workflow_is_not_referenced() -> None:
     for name in ("README.md", "DEPLOYMENT.md"):
         document = (ROOT / name).read_text(encoding="utf-8")
         assert "scripts/backup.sh" not in document
+
+
+def test_social_provider_registry_is_typed_and_secret_free() -> None:
+    values = env_example()
+    for provider in ("GOOGLE", "GITHUB", "DISCORD"):
+        assert f"{provider}_CLIENT_ID" in values
+        assert f"{provider}_CLIENT_SECRET" in values
+
+    registry = (ROOT / "auth" / "src" / "providers.ts").read_text(encoding="utf-8")
+    auth = (ROOT / "auth" / "src" / "auth.ts").read_text(encoding="utf-8")
+    bridge = (ROOT / "auth" / "src" / "index.ts").read_text(encoding="utf-8")
+    client = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id: "google"' in registry
+    assert 'id: "github"' in registry
+    assert 'id: "discord"' in registry
+    assert 'scopes: ["read:user", "user:email"]' in registry
+    assert 'scopes: ["identify", "email"]' in registry
+    assert "clientSecret" not in registry.split("publicProviders.push", 1)[1]
+    assert "allowDifferentEmails: false" in auth
+    assert "allowUnlinkingAll: false" in auth
+    assert "updateUserInfoOnLink: false" in auth
+    assert "trustedProviders" not in auth
+    assert 'app.get("/api/auth/vault/providers"' in bridge
+    assert 'c.header("Cache-Control", "no-store")' in bridge
+    assert "data-google-login" not in client
+    assert "errorCallbackURL" in client
+
+
+def test_ci_builds_images_once_and_uses_fast_health_probes() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    override = (ROOT / "docker-compose.ci.yml").read_text(encoding="utf-8")
+    assert "branches: [main]" in workflow
+    assert "cancel-in-progress: true" in workflow
+    assert "images:" not in workflow
+    assert workflow.count("docker/build-push-action@v6") == 2
+    assert workflow.count("cache-to: type=gha,mode=max") == 2
+    assert "docker compose up -d --no-build" in workflow
+    assert "docker compose up -d --no-deps --force-recreate vault" in workflow
+    assert "start_interval: 1s" in override
+
+
+def test_upgrade_path_retains_backup_and_rollback_images() -> None:
+    upgrade = (ROOT / "scripts" / "upgrade.sh").read_text(encoding="utf-8")
+    assert "Docker Engine 25.0.0+ is required" in upgrade
+    assert "Docker Compose 2.20.2+ is required" in upgrade
+    assert "pg_dump -Fc" in upgrade
+    assert "compose build auth vault" in upgrade
+    assert "compose build --pull auth vault" in upgrade
+    assert "--no-build --wait --wait-timeout 120 auth vault" in upgrade
+    assert "restore_images" in upgrade

@@ -3,7 +3,7 @@
 A lightweight, self-hosted team vault for pasted text and arbitrary files.
 
 The main application is a Rust/Axum server. A small Hono service runs Better Auth for
-Google login, password login, account approvals, workspaces, and API keys. PostgreSQL
+password and optional Google, GitHub, or Discord login, account approvals, workspaces, and API keys. PostgreSQL
 stores searchable metadata; file bytes stay on a persistent VPS volume.
 
 ## What it does
@@ -13,7 +13,7 @@ stores searchable metadata; file bytes stay on a persistent VPS volume.
 - Inline previews for text, code, safe HTML/Markdown, images, and ranged PDFs.
 - Private workspaces with owner, admin, and member roles.
 - Global approval queue for every new account.
-- Google and password login through Better Auth.
+- Password login plus optional Google, GitHub, and Discord login through Better Auth.
 - Workspace API keys with read, write, and delete permissions.
 - Ready-to-run Python multipart and resumable file uploaders.
 - Trash, restore, search, tags, exports, and activity records.
@@ -42,9 +42,9 @@ communicate through a private Docker network.
 
 Requirements:
 
-- Docker Engine with the Docker Compose plugin.
-- A domain name for production Google login and HTTPS.
-- Google OAuth credentials if Google login is enabled.
+- Docker Engine 25 or newer with Docker Compose 2.20.2 or newer.
+- A domain name for production social login and HTTPS.
+- A client ID and secret for each social provider you enable.
 
 ```bash
 cp .env.example .env
@@ -69,9 +69,47 @@ Run that command separately for `POSTGRES_PASSWORD`, `BETTER_AUTH_SECRET`,
 
 For a real VPS, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 
-## Google authentication
+## Social authentication
 
-In Google Cloud Console:
+Social providers are enabled only when both variables in their credential pair are set. A
+partial pair fails startup with the missing variable named in the error; no credentials are
+ever returned by the provider-discovery endpoint.
+
+Register these exact production callbacks in the relevant provider console:
+
+```text
+https://vault.your-domain.com/api/auth/callback/google
+https://vault.your-domain.com/api/auth/callback/github
+https://vault.your-domain.com/api/auth/callback/discord
+```
+
+Set one or more complete pairs in the private VPS `.env`:
+
+```dotenv
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GITHUB_CLIENT_ID=...
+GITHUB_CLIENT_SECRET=...
+DISCORD_CLIENT_ID=...
+DISCORD_CLIENT_SECRET=...
+PUBLIC_BASE_URL=https://vault.your-domain.com
+DOMAIN=vault.your-domain.com
+```
+
+For Google, create a Web application OAuth client. For GitHub OAuth Apps, request
+`user:email`; GitHub Apps additionally need read-only Email addresses permission. Discord
+uses only `identify` and `email`, with no bot or guild permissions.
+
+Better Auth links a social identity to an existing user only when the provider verifies the
+same email address. Different-email linking, forced trusted-provider linking, profile
+overwrites during linking, and unlinking the last identity are disabled. A provider account
+without a verified email is rejected rather than assigned a placeholder address.
+
+To add another built-in Better Auth provider, extend the typed registry in
+`auth/src/providers.ts`, add its credential pair, tests, callback documentation, and release
+it normally. The login page does not need provider-specific browser logic.
+
+For example, in Google Cloud Console:
 
 1. Create or select a project.
 2. Open APIs & Services, then Credentials.
@@ -82,17 +120,10 @@ In Google Cloud Console:
 https://vault.your-domain.com/api/auth/callback/google
 ```
 
-5. Put the client ID and secret into the private VPS `.env`:
+5. Put the client ID and secret into the private VPS `.env`.
 
-```dotenv
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-PUBLIC_BASE_URL=https://vault.your-domain.com
-DOMAIN=vault.your-domain.com
-```
-
-The URL scheme, hostname, path, and trailing slash must match exactly. Google production
-callbacks require HTTPS and normally cannot use a raw VPS IP address.
+The URL scheme, hostname, path, and trailing slash must match exactly. Production callbacks
+require HTTPS and normally cannot use a raw VPS IP address.
 
 ## Accounts and workspaces
 
@@ -228,7 +259,7 @@ The API returns a consistent error body:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cd auth && pnpm install && pnpm typecheck && pnpm build
+cd auth && pnpm install --frozen-lockfile && pnpm test && pnpm build
 python -m pytest -q tests
 ```
 

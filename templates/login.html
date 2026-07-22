@@ -9,8 +9,14 @@
   </div>
   <div class="panel auth-panel">
     <h2>Sign in</h2>
-    <button class="button google" type="button" data-google-login>Continue with Google</button>
-    <div class="divider"><span>or</span></div>
+    <div class="social-providers" data-social-providers hidden aria-label="Social sign-in options"></div>
+    <template data-social-provider-template>
+      <button class="button social-provider" type="button">
+        <span class="provider-mark" data-provider-mark aria-hidden="true"></span>
+        <span data-provider-label></span>
+      </button>
+    </template>
+    <div class="divider" data-social-divider hidden><span>or</span></div>
     <form data-auth-form="signin" class="stack">
       <label>Email<input type="email" name="email" autocomplete="email" required></label>
       <label>Password<input type="password" name="password" autocomplete="current-password" minlength="8" required></label>
@@ -29,4 +35,3 @@
   </div>
 </section>
 {% endblock %}
-

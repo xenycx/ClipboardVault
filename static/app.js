@@ -30,7 +30,8 @@
 
   const errorBox = document.querySelector("[data-auth-error]");
   const showError = (message) => { if (errorBox) errorBox.textContent = message || "Something went wrong."; };
-  const requestedReturn = new URLSearchParams(window.location.search).get("returnTo") || "/pending";
+  const authParameters = new URLSearchParams(window.location.search);
+  const requestedReturn = authParameters.get("returnTo") || "/pending";
   const returnTo = requestedReturn.startsWith("/") && !requestedReturn.startsWith("//") ? requestedReturn : "/pending";
   const authRequest = async (path, body) => {
     const response = await fetch(path, {
@@ -52,13 +53,75 @@
       catch (error) { showError(error.message); }
     });
   });
-  const google = document.querySelector("[data-google-login]");
-  if (google) google.addEventListener("click", async () => {
+  const oauthErrorMessages = {
+    email_not_found: "This provider did not return a verified email address. Add one there or use another sign-in method.",
+    email_is_missing: "This provider did not return a verified email address. Add one there or use another sign-in method.",
+    unable_to_get_user_info: "This provider did not return a verified email address. Add one there or use another sign-in method.",
+    email_not_verified: "This provider did not return a verified email address. Add one there or use another sign-in method.",
+    account_not_linked: "This identity could not be linked safely. Sign in with the method already attached to your account.",
+    unable_to_link_account: "This identity could not be linked safely. Sign in with the method already attached to your account.",
+    account_already_linked_to_different_user: "That social account is already linked to another user.",
+    access_denied: "Social sign-in was cancelled or denied.",
+  };
+  const oauthError = authParameters.get("error") || authParameters.get("oauthError");
+  if (oauthError) {
+    showError(oauthErrorMessages[oauthError] || "Social sign-in could not be completed. Please try again or use email and password.");
+    authParameters.delete("error");
+    authParameters.delete("oauthError");
+    authParameters.delete("error_description");
+    const cleanQuery = authParameters.toString();
+    window.history.replaceState({}, "", window.location.pathname + (cleanQuery ? `?${cleanQuery}` : ""));
+  }
+
+  const socialProviders = document.querySelector("[data-social-providers]");
+  const socialProviderTemplate = document.querySelector("[data-social-provider-template]");
+  const socialDivider = document.querySelector("[data-social-divider]");
+  const startSocialSignIn = async (button, provider) => {
+    showError("");
+    button.disabled = true;
     try {
-      const data = await authRequest("/api/auth/sign-in/social", { provider: "google", callbackURL: returnTo });
-      if (data.url) window.location.assign(data.url);
-    } catch (error) { showError(error.message); }
-  });
+      const errorCallbackURL = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+      const data = await authRequest("/api/auth/sign-in/social", {
+        provider,
+        callbackURL: returnTo,
+        errorCallbackURL,
+      });
+      if (!data.url) throw new Error("The provider did not return a sign-in URL");
+      window.location.assign(data.url);
+    } catch (error) {
+      button.disabled = false;
+      showError(error.message);
+    }
+  };
+  if (socialProviders && socialProviderTemplate) {
+    fetch("/api/auth/vault/providers", {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    }).then(async (response) => {
+      if (!response.ok) throw new Error("Could not load social providers");
+      return response.json();
+    }).then((payload) => {
+      const providers = Array.isArray(payload?.data?.providers) ? payload.data.providers : [];
+      providers.forEach((provider) => {
+        if (!provider || !/^[a-z0-9-]+$/.test(provider.id) || typeof provider.label !== "string") return;
+        const fragment = socialProviderTemplate.content.cloneNode(true);
+        const button = fragment.querySelector("button");
+        if (!button) return;
+        button.dataset.socialProvider = provider.id;
+        button.querySelector("[data-provider-mark]").textContent = provider.label.slice(0, 1).toUpperCase();
+        button.querySelector("[data-provider-label]").textContent = `Continue with ${provider.label}`;
+        button.addEventListener("click", () => startSocialSignIn(button, provider.id));
+        socialProviders.append(fragment);
+      });
+      if (socialProviders.children.length) {
+        socialProviders.hidden = false;
+        if (socialDivider) socialDivider.hidden = false;
+      }
+    }).catch(() => {
+      // Email/password remains available when provider discovery is unavailable.
+    });
+  }
   document.querySelectorAll("[data-signout]").forEach((button) => {
     button.addEventListener("click", async () => {
       await authRequest("/api/auth/sign-out", {}); window.location.assign("/login");

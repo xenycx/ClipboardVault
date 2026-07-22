@@ -13,6 +13,10 @@ Security fixes are applied to the latest release on the default branch.
 - Every item query includes the active organization ID.
 - API keys are bound to an organization, shown once, rate-limited, and revocable.
 - New accounts cannot access workspace data before global approval.
+- Social identities link automatically only when the provider verifies an email matching the
+  existing user. Different-email and trusted-provider forced linking are disabled.
+- OAuth provider discovery exposes IDs and labels only; incomplete credential pairs stop the
+  auth service before it can accept traffic.
 - First-admin setup requires a private token and closes permanently after use.
 - Invitation tokens are random, stored only as SHA-256 hashes, expire, and work once.
 - User filenames and virtual paths never become operating-system storage paths.

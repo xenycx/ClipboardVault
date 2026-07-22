@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
+    "test": "tsx --test src/providers.test.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "auth:generate": "pnpm dlx auth@1.6.23 generate --config src/auth.ts --output migrations/generated.sql --yes",

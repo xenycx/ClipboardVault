@@ -18,6 +18,7 @@ services:
     networks: [backend]
   auth:
     build: { context: ./auth }
+    image: clipboard-vault-auth:local
     restart: unless-stopped
     environment:
       AUTH_PORT: "3001"
@@ -28,6 +29,10 @@ services:
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
     depends_on:
       postgres: { condition: service_healthy }
     networks: [backend]
@@ -36,6 +41,7 @@ services:
     security_opt: [no-new-privileges:true]
   vault:
     build: { context: . }
+    image: clipboard-vault:local
     restart: unless-stopped
     environment:
       PORT: "8080"

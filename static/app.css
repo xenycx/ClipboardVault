@@ -237,8 +237,9 @@ input:focus, textarea:focus, select:focus { border-color: color-mix(in srgb, var
 .button:hover { border-color: color-mix(in srgb, var(--line-strong) 70%, var(--text)); background: var(--panel-hover); transform: translateY(-1px); }
 .button.primary { border-color: var(--green); color: var(--green-ink); background: var(--green); box-shadow: 0 10px 25px var(--green-wash); }
 .button.primary:hover { border-color: var(--green-hover); background: var(--green-hover); }
-.button.google { width: 100%; border-color: #e2e5e8; color: #1d2329; background: #fff; }
-.button.google:hover { color: #111; background: #f7f7f7; }
+.social-providers { display: grid; gap: 9px; }
+.button.social-provider { width: 100%; justify-content: flex-start; color: var(--text); background: var(--panel-2); }
+.provider-mark { width: 24px; height: 24px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted); background: var(--panel-solid); font-size: 10px; font-weight: 850; }
 .button.small { min-height: 34px; padding: 6px 12px; font-size: 11px; }
 .danger { color: var(--red) !important; }
 .button.danger { border-color: color-mix(in srgb, var(--red) 35%, var(--line)); background: var(--red-wash); }
