@@ -4,8 +4,9 @@ This directory is the asset half of the server-rendered frontend. There is no bu
 
 ## Asset ownership
 
-- `app.css`: the complete responsive design system, dark/light theme tokens, shared components, page layouts, dialogs, tables, and accessibility states.
-- `app.js`: progressive enhancement for authentication, sign-out, copy/delete/filter actions, resumable uploads, storage purge, and file previews.
+- `app.css`: the complete responsive design system, dark/light theme tokens, application shell, shared components, page layouts, dialogs, tables, and accessibility states.
+- `app.js`: progressive enhancement for authentication, sign-out, navigation, the command palette, copy/delete/restore/filter actions, resumable uploads, storage meters and purge, and file previews.
+- `theme.js`: applied before first paint, so the theme never flashes. It must stay a separate file because the CSP forbids inline scripts; the same rule bans inline event handlers such as `onchange`.
 - `vendor/`: pinned, locally served third-party preview libraries and styles. Do not edit minified vendor files manually.
 
 ## DOM contract
@@ -41,7 +42,7 @@ This directory is the asset half of the server-rendered frontend. There is no bu
 ## CSS and theming rules
 
 - Use the existing custom properties. Add a semantic token before repeating hard-coded color values across components.
-- Dark and light are two modes of the same design, not independent themes.
+- Dark and light are two modes of the same design, not independent themes. Without JavaScript the page follows `prefers-color-scheme`.
 - Keep contrast, visible focus, reduced-motion behavior, touch targets, overflow handling, and mobile navigation intact.
 - Avoid inline style attributes and CSS that depends on JavaScript for basic readability.
 

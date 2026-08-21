@@ -722,6 +722,28 @@ pub fn available_space(path: &Path) -> AppResult<u64> {
     Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
 }
 
+/// Total size of the filesystem holding `path`, or `0` when it cannot be measured.
+#[cfg(unix)]
+pub fn total_space(path: &Path) -> AppResult<u64> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| AppError::Validation("upload path is invalid".into()))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL terminated and `stats` points to writable memory.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: statvfs initialized the structure after returning success.
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_blocks.saturating_mul(stats.f_frsize))
+}
+
+/// Zero means "unknown"; the storage page hides the capacity gauge in that case.
+#[cfg(not(unix))]
+pub fn total_space(_path: &Path) -> AppResult<u64> {
+    Ok(0)
+}
+
 #[cfg(not(unix))]
 pub fn available_space(_path: &Path) -> AppResult<u64> {
     // Disk admission is enforced on the Linux production host. Keep local Windows

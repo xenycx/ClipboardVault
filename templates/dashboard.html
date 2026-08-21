@@ -1,83 +1,171 @@
-{% extends "base.html" %}
-{% block nav %}
-<nav class="nav">
-  <form action="/workspaces/switch" method="post">
-    <select name="organization_id" aria-label="Active workspace" onchange="this.form.submit()">
-      {% for membership in session.memberships %}<option value="{{ membership.organization_id }}" {% if membership.organization_id == session.active_organization_id.as_deref().unwrap_or("") %}selected{% endif %}>{{ membership.organization_name }}</option>{% endfor %}
-    </select>
-  </form>
-  <a href="/keys">Keys & team</a>
-  <a href="/storage">Storage</a>
-  {% if session.user.role.contains("admin") %}<a href="/admin">Accounts</a>{% endif %}
-  <button class="link-button" type="button" data-signout>Sign out</button>
-</nav>
+{% extends "app_base.html" %}
+{% block crumbs %}
+<h1 class="topbar-heading">{% if trash %}Trash{% else %}Vault{% endif %}</h1>
+<span class="count-chip">{{ items.len() }} {% if items.len() == 1 %}item{% else %}items{% endif %}</span>
+{% endblock %}
+{% block topbar_actions %}
+<details class="menu">
+  <summary class="button quiet"><svg class="i" aria-hidden="true"><use href="#i-download"/></svg><span class="hide-mob">Export</span></summary>
+  <div class="menu-body">
+    <a class="menu-item" href="/api/v1/items/export?format=json"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>Export as JSON</a>
+    <a class="menu-item" href="/api/v1/items/export?format=csv"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>Export as CSV</a>
+  </div>
+</details>
 {% endblock %}
 {% block content %}
-<section class="hero-row">
-  <div class="hero-copy"><span class="eyebrow">{{ active_workspace_name }}</span><h1>Your working memory.</h1><p>Save text, code, links, and files in one private workspace. Clipboard Vault only stores what you explicitly submit.</p></div>
-  <div class="metric"><span class="metric-dot" aria-hidden="true"></span><div><strong>{{ items.len() }}</strong><span>recent items</span></div></div>
-</section>
-<aside class="storage-warning" data-storage-warning hidden role="status">
+<aside class="banner warn" data-storage-warning hidden role="status">
+  <svg class="i" aria-hidden="true"><use href="#i-alert"/></svg>
   <div><strong>Storage is running low.</strong><span>Large uploads may be paused until space is reclaimed.</span></div>
-  <a class="button" href="/storage">Review storage</a>
+  <a class="button quiet" href="/storage">Review storage</a>
 </aside>
-<section class="capture-grid">
-  <form action="/capture" method="post" class="panel composer">
-    <div class="panel-heading"><div><span class="panel-kicker">Quick capture</span><h2>Paste something</h2></div><span>Manual only</span></div>
-    <label class="sr-only" for="payload">Content</label>
-    <textarea id="payload" name="payload" rows="8" placeholder="Paste text, code, HTML, or a URL…" required></textarea>
-    <div class="form-grid">
-      <label>Type<select name="kind"><option value="auto">Detect automatically</option><option value="text">Text</option><option value="code">Code</option><option value="html">HTML</option><option value="url">URL</option></select></label>
-      <label>Virtual folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
-      <label>Tags<input name="tags" placeholder="work, reference"></label>
-      <label>Source URL<input type="url" name="source_url" placeholder="https://…"></label>
+
+{% if !trash %}
+<section class="composer" aria-label="Add to vault">
+  <input type="radio" name="capture-mode" id="mode-paste" class="mode-radio" checked>
+  <input type="radio" name="capture-mode" id="mode-upload" class="mode-radio">
+  <div class="composer-head">
+    <div class="segmented">
+      <label for="mode-paste"><svg class="i" aria-hidden="true"><use href="#i-text"/></svg>Paste</label>
+      <label for="mode-upload"><svg class="i" aria-hidden="true"><use href="#i-upload"/></svg>Upload</label>
     </div>
-    <button class="button primary" type="submit">Save to vault</button>
+    <span class="composer-hint hide-mob">Nothing is captured until you save it.</span>
+  </div>
+
+  <form action="/capture" method="post" class="pane pane-paste" data-capture-form>
+    <label class="sr-only" for="payload">Content</label>
+    <textarea id="payload" name="payload" rows="6" placeholder="Paste text, code, HTML, or a URL…" required data-capture-input></textarea>
+    <div class="pane-row">
+      <label class="field compact">Type
+        <select name="kind">
+          <option value="auto">Detect</option>
+          <option value="text">Text</option>
+          <option value="code">Code</option>
+          <option value="html">HTML</option>
+          <option value="url">URL</option>
+        </select>
+      </label>
+      <label class="field compact">Folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
+      <label class="field compact">Tags<input name="tags" placeholder="work, reference"></label>
+      <label class="field compact">Source URL<input type="url" name="source_url" placeholder="https://…"></label>
+    </div>
+    <div class="pane-foot">
+      <span class="pane-note"><kbd class="kbd">Ctrl</kbd><kbd class="kbd">Enter</kbd> to save</span>
+      <button class="button primary" type="submit"><svg class="i" aria-hidden="true"><use href="#i-plus"/></svg>Save to vault</button>
+    </div>
   </form>
-  <form action="/api/v1/items" method="post" enctype="multipart/form-data" class="panel uploader" data-upload-form data-max-upload-mb="{{ max_upload_mb }}">
-    <div class="panel-heading"><div><span class="panel-kicker">File transfer</span><h2>Upload a file</h2></div><span>Up to {{ max_upload_mb }} MB</span></div>
-    <label class="dropzone" data-dropzone><input type="file" name="file" required><span class="dropzone-icon" aria-hidden="true">↑</span><strong>Drop any file here</strong><span>or click to browse</span></label>
-    <label>Virtual folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
-    <label>Tags<input name="tags" placeholder="report, monthly"></label>
-    <button class="button" type="submit" data-upload-start>Upload file</button>
+
+  <form action="/api/v1/items" method="post" enctype="multipart/form-data" class="pane pane-upload" data-upload-form data-max-upload-mb="{{ max_upload_mb }}">
+    <label class="dropzone" data-dropzone>
+      <input type="file" name="file" required>
+      <span class="dropzone-icon" aria-hidden="true"><svg class="i"><use href="#i-upload"/></svg></span>
+      <strong>Drop a file, or click to browse</strong>
+      <span class="dropzone-note">Streamed in chunks &middot; up to {{ max_upload_mb }} MB</span>
+    </label>
+    <div class="pane-row">
+      <label class="field compact">Folder<input name="virtual_path" value="/" placeholder="/reports/2026"></label>
+      <label class="field compact">Tags<input name="tags" placeholder="report, monthly"></label>
+    </div>
     <progress data-upload-progress max="100" value="0" hidden aria-label="Upload progress"></progress>
     <p class="upload-status" data-upload-status aria-live="polite"></p>
-    <div class="upload-controls" data-upload-controls hidden>
-      <button class="button small" type="button" data-upload-pause>Pause</button>
-      <button class="button small" type="button" data-upload-resume hidden>Resume</button>
-      <button class="button small" type="button" data-upload-retry hidden>Retry</button>
-      <button class="button small danger" type="button" data-upload-cancel>Cancel</button>
+    <div class="pane-foot">
+      <div class="upload-controls" data-upload-controls hidden>
+        <button class="button quiet small" type="button" data-upload-pause>Pause</button>
+        <button class="button quiet small" type="button" data-upload-resume hidden>Resume</button>
+        <button class="button quiet small" type="button" data-upload-retry hidden>Retry</button>
+        <button class="button quiet small danger" type="button" data-upload-cancel>Cancel</button>
+      </div>
+      <button class="button primary" type="submit" data-upload-start><svg class="i" aria-hidden="true"><use href="#i-upload"/></svg>Upload file</button>
     </div>
   </form>
 </section>
-<section class="items-section">
-  <div class="section-heading"><div><span class="eyebrow">LATEST</span><h2>Vault items</h2></div><label class="filter-field"><span class="sr-only">Filter items</span><input type="search" placeholder="Search this page…" data-item-filter aria-label="Filter items"></label></div>
-  <div class="item-list" role="region" aria-live="polite">
-    {% if items.is_empty() %}<div class="empty panel"><h3>Your vault is empty</h3><p>Paste content above or upload a file. Clipboard Vault only stores what you explicitly submit.</p></div>{% endif %}
+{% endif %}
+
+<section class="items-section" aria-label="Vault items">
+  <div class="toolbar">
+    <form class="search-form" method="get" action="/">
+      {% if trash %}<input type="hidden" name="trash" value="1">{% endif %}
+      <div class="search-field">
+        <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+        <label class="sr-only" for="vault-search">Search this workspace</label>
+        <input id="vault-search" type="search" name="q" value="{{ query }}" placeholder="Search this workspace&hellip;" data-item-filter autocomplete="off">
+      </div>
+      <button class="button quiet" type="submit">Search</button>
+      {% if !query.is_empty() %}<a class="button quiet" href="{% if trash %}/?trash=1{% else %}/{% endif %}">Clear</a>{% endif %}
+    </form>
+    <div class="chips">
+      {% for chip in chips %}<a class="chip" href="{{ chip.href }}" {% if chip.active %}aria-current="true"{% endif %}>{{ chip.label }}<span class="chip-count">{{ chip.count }}</span></a>{% endfor %}
+    </div>
+  </div>
+
+  <div class="item-grid" role="region" aria-live="polite">
+    {% if items.is_empty() %}
+    <div class="empty">
+      <span class="empty-art" aria-hidden="true"><svg class="i"><use href="#{% if trash %}i-trash{% else %}i-inbox{% endif %}"/></svg></span>
+      {% if trash %}<h2>Trash is empty</h2><p>Deleted items rest here until they are purged from the storage page.</p>
+      {% else if !query.is_empty() %}<h2>No matches</h2><p>Nothing in this workspace matches that search. Try a shorter phrase.</p><a class="button quiet" href="/">Clear search</a>
+      {% else %}<h2>Your vault is empty</h2><p>Paste a snippet or drop a file above. Clipboard Vault only ever stores what you explicitly submit.</p>{% endif %}
+    </div>
+    {% endif %}
     {% for item in items %}
-    <article class="item-card" data-item-card data-search="{{ item.kind }} {{ item.virtual_path }} {{ item.original_filename.as_deref().unwrap_or("") }}">
-      <div class="type-pill {{ item.kind }}">{{ item.kind }}</div>
+    <article class="item kind-{{ item.kind }}" data-item-card data-search="{{ item.kind }} {{ item.virtual_path }} {{ item.display_name() }}">
+      <header class="item-head">
+        <span class="item-icon" aria-hidden="true"><svg class="i"><use href="#{% if item.kind == "code" %}i-code{% else if item.kind == "url" %}i-link{% else if item.kind == "image" %}i-image{% else if item.kind == "html" %}i-html{% else if item.kind == "text" %}i-text{% else %}i-file{% endif %}"/></svg></span>
+        <div class="item-title">
+          <h3>{{ item.display_name() }}</h3>
+          <p class="item-meta"><span class="kind">{{ item.kind }}</span><span>{{ item.size_bytes|format_bytes }}</span><span class="hide-mob">{{ item.virtual_path }}</span><time datetime="{{ item.created_at.format("%Y-%m-%dT%H:%M:%SZ") }}" title="{{ item.created_at.format("%Y-%m-%d %H:%M UTC") }}">{{ item.age() }}</time></p>
+        </div>
+      </header>
       <div class="item-body">
-        <div class="item-meta"><span>{{ item.virtual_path }}</span><span>{{ item.size_bytes|format_bytes }}</span><time>{{ item.created_at.format("%Y-%m-%d %H:%M") }}</time></div>
-        {% match item.text_payload %}{% when Some with (payload) %}{% if item.kind == "html" %}<iframe class="html-preview" sandbox="" referrerpolicy="no-referrer" srcdoc="{{ payload }}" title="Sandboxed HTML preview"></iframe><details><summary>View escaped source</summary><pre>{{ payload }}</pre></details>{% else %}<pre>{{ payload }}</pre>{% endif %}{% when None %}<a class="file-link" href="/api/v1/items/{{ item.id }}/content">{{ item.original_filename.as_deref().unwrap_or("Download file") }}</a>{% endmatch %}
+        {% match item.text_payload %}
+        {% when Some with (payload) %}
+          {% if item.kind == "html" %}
+          <iframe class="html-preview" sandbox="" referrerpolicy="no-referrer" srcdoc="{{ payload }}" title="Sandboxed HTML preview"></iframe>
+          <details class="source-toggle"><summary>Escaped source</summary><pre class="item-pre">{{ payload }}</pre></details>
+          {% else %}
+          <pre class="item-pre">{{ payload }}</pre>
+          {% endif %}
+        {% when None %}
+          <a class="file-chip" href="/api/v1/items/{{ item.id }}/content">
+            <svg class="i" aria-hidden="true"><use href="#i-file"/></svg>
+            <span>{{ item.original_filename.as_deref().unwrap_or("Download file") }}</span>
+          </a>
+        {% endmatch %}
       </div>
-      <div class="item-actions">
-        {% match item.text_payload %}{% when Some with (payload) %}<button class="icon-button" type="button" data-copy-value="{{ payload }}">Copy</button>{% when None %}
-        <button class="icon-button" type="button" data-preview-id="{{ item.id }}" data-preview-kind="{{ item.kind }}" data-preview-size="{{ item.size_bytes }}" data-preview-name="{{ item.original_filename.as_deref().unwrap_or("File preview") }}">Preview</button>
-        <a class="icon-button" href="/api/v1/items/{{ item.id }}/content?download=1" download>Download</a>{% endmatch %}
-        <button class="icon-button danger" type="button" data-delete-id="{{ item.id }}">Delete</button>
-      </div>
+      <footer class="item-foot">
+        <div class="item-tags">{% for tag in item.tag_list() %}<span class="tag">{{ tag }}</span>{% endfor %}</div>
+        <div class="item-actions">
+          {% match item.text_payload %}
+          {% when Some with (payload) %}<button class="icon-btn" type="button" data-copy-value="{{ payload }}" aria-label="Copy content" title="Copy"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg></button>
+          {% when None %}
+          <button class="icon-btn" type="button" data-preview-id="{{ item.id }}" data-preview-kind="{{ item.kind }}" data-preview-size="{{ item.size_bytes }}" data-preview-name="{{ item.original_filename.as_deref().unwrap_or("File preview") }}" aria-label="Preview file" title="Preview"><svg class="i" aria-hidden="true"><use href="#i-eye"/></svg></button>
+          <a class="icon-btn" href="/api/v1/items/{{ item.id }}/content?download=1" download aria-label="Download file" title="Download"><svg class="i" aria-hidden="true"><use href="#i-download"/></svg></a>
+          {% endmatch %}
+          {% if trash %}
+          <button class="icon-btn" type="button" data-restore-id="{{ item.id }}" aria-label="Restore item" title="Restore"><svg class="i" aria-hidden="true"><use href="#i-restore"/></svg></button>
+          <button class="icon-btn danger" type="button" data-purge-id="{{ item.id }}" aria-label="Delete permanently" title="Delete permanently"><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg></button>
+          {% else %}
+          <button class="icon-btn danger" type="button" data-delete-id="{{ item.id }}" aria-label="Move to trash" title="Move to trash"><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg></button>
+          {% endif %}
+        </div>
+      </footer>
     </article>
     {% endfor %}
   </div>
 </section>
+
 <dialog class="preview-dialog" data-preview-dialog aria-labelledby="preview-title">
   <div class="preview-shell">
     <header class="preview-header">
-      <div><h2 id="preview-title" data-preview-title>File preview</h2><p data-preview-meta></p></div>
-      <div class="preview-actions"><a class="button" data-preview-download download>Download</a><button class="button" type="button" data-preview-close aria-label="Close preview">Close</button></div>
+      <div class="preview-id"><h2 id="preview-title" data-preview-title>File preview</h2><p data-preview-meta></p></div>
+      <div class="preview-actions">
+        <a class="button quiet" data-preview-download download><svg class="i" aria-hidden="true"><use href="#i-download"/></svg>Download</a>
+        <button class="icon-btn" type="button" data-preview-close aria-label="Close preview"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
     </header>
-    <nav class="preview-tabs" data-preview-tabs hidden aria-label="Preview mode"><button type="button" data-preview-tab="rendered" aria-selected="true">Rendered</button><button type="button" data-preview-tab="source" aria-selected="false">Source</button></nav>
+    <nav class="preview-tabs" data-preview-tabs hidden aria-label="Preview mode">
+      <button type="button" data-preview-tab="rendered" aria-selected="true">Rendered</button>
+      <button type="button" data-preview-tab="source" aria-selected="false">Source</button>
+    </nav>
     <div class="preview-body" data-preview-body></div>
   </div>
 </dialog>

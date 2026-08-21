@@ -153,7 +153,28 @@
     button.addEventListener("click", async () => {
       if (!window.confirm("Move this item to trash?")) return;
       const response = await fetch("/api/v1/items/" + encodeURIComponent(button.dataset.deleteId), { method: "DELETE", credentials: "same-origin" });
-      if (response.ok) button.closest("[data-item-card]")?.remove(); else toast("Delete failed");
+      if (!response.ok) return toast("Delete failed");
+      button.closest("[data-item-card]")?.remove();
+      toast("Moved to trash");
+    });
+  });
+  document.querySelectorAll("[data-restore-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const path = "/api/v1/items/" + encodeURIComponent(button.dataset.restoreId) + "/restore";
+      const response = await fetch(path, { method: "POST", credentials: "same-origin" });
+      if (!response.ok) return toast("Restore failed");
+      button.closest("[data-item-card]")?.remove();
+      toast("Restored to the vault");
+    });
+  });
+  document.querySelectorAll("[data-purge-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("Permanently delete this item? This cannot be undone.")) return;
+      const path = "/api/v1/items/" + encodeURIComponent(button.dataset.purgeId) + "/purge";
+      const response = await fetch(path, { method: "POST", credentials: "same-origin" });
+      if (!response.ok) return toast("Permanent delete failed");
+      button.closest("[data-item-card]")?.remove();
+      toast("Permanently deleted");
     });
   });
   const filter = document.querySelector("[data-item-filter]");
@@ -163,6 +184,107 @@
       card.hidden = Boolean(term && !(card.dataset.search || card.textContent).toLowerCase().includes(term));
     });
   });
+
+  const sidebar = document.querySelector("[data-sidebar]");
+  if (sidebar) {
+    const scrim = document.querySelector("[data-nav-scrim]");
+    const setNav = (open) => {
+      sidebar.classList.toggle("is-open", open);
+      scrim?.classList.toggle("is-open", open);
+      document.body.classList.toggle("nav-open", open);
+    };
+    document.querySelector("[data-nav-open]")?.addEventListener("click", () => setNav(true));
+    document.querySelector("[data-nav-close]")?.addEventListener("click", () => setNav(false));
+    scrim?.addEventListener("click", () => setNav(false));
+    sidebar.querySelectorAll("a").forEach((link) => link.addEventListener("click", () => setNav(false)));
+    window.addEventListener("keydown", (event) => { if (event.key === "Escape") setNav(false); });
+  }
+
+  const workspaceForm = document.querySelector("[data-workspace-form]");
+  if (workspaceForm) {
+    const workspaceSelect = workspaceForm.querySelector("[data-workspace-select]");
+    const workspaceAvatar = document.querySelector("[data-ws-avatar]");
+    const paintWorkspace = () => {
+      if (!workspaceAvatar) return;
+      const label = (workspaceSelect?.selectedOptions?.[0]?.textContent || "").trim();
+      workspaceAvatar.textContent = label.slice(0, 1) || "W";
+    };
+    paintWorkspace();
+    // With scripting available the select submits itself; the button is the no-JS fallback.
+    const workspaceSubmit = workspaceForm.querySelector("[data-workspace-submit]");
+    if (workspaceSubmit) workspaceSubmit.hidden = true;
+    workspaceSelect?.addEventListener("change", () => { paintWorkspace(); workspaceForm.submit(); });
+  }
+
+  const captureForm = document.querySelector("[data-capture-form]");
+  captureForm?.querySelector("[data-capture-input]")?.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      captureForm.requestSubmit();
+    }
+  });
+
+  const dropzone = document.querySelector("[data-dropzone]");
+  if (dropzone) {
+    const dropTarget = dropzone.querySelector("input[type=file]");
+    const uploadMode = document.getElementById("mode-upload");
+    ["dragenter", "dragover"].forEach((name) => dropzone.addEventListener(name, (event) => {
+      event.preventDefault();
+      dropzone.classList.add("is-over");
+    }));
+    ["dragleave", "dragend", "drop"].forEach((name) => dropzone.addEventListener(name, () => dropzone.classList.remove("is-over")));
+    dropzone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const file = event.dataTransfer?.files?.[0];
+      if (!file || !dropTarget) return;
+      const bucket = new DataTransfer();
+      bucket.items.add(file);
+      dropTarget.files = bucket.files;
+      dropTarget.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    // Dragging a file anywhere over the page reveals the upload pane.
+    window.addEventListener("dragover", (event) => {
+      if (!uploadMode || uploadMode.checked) return;
+      if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes("Files")) uploadMode.checked = true;
+    });
+  }
+
+  const gauge = document.querySelector("[data-gauge]");
+  if (gauge) {
+    const total = Number(gauge.dataset.total || 0);
+    const used = Math.max(0, Number(gauge.dataset.used || 0));
+    const workspace = Math.min(Math.max(0, Number(gauge.dataset.workspace || 0)), used);
+    if (total > 0) {
+      const share = (value) => Math.max(0, Math.min(100, (value / total) * 100)).toFixed(2) + "%";
+      gauge.querySelector("[data-gauge-ws]")?.style.setProperty("--w", share(workspace));
+      gauge.querySelector("[data-gauge-other]")?.style.setProperty("--w", share(used - workspace));
+    }
+  }
+
+  const purgeChoices = Array.from(document.querySelectorAll("[data-purge-item]"));
+  if (purgeChoices.length) {
+    const selectAll = document.querySelector("[data-select-all]");
+    const purgeSummary = document.querySelector("[data-purge-summary]");
+    const syncSelection = () => {
+      const chosen = purgeChoices.filter((box) => box.checked);
+      const bytes = chosen.reduce((total, box) => total + Number(box.dataset.bytes || 0), 0);
+      if (purgeSummary) {
+        purgeSummary.textContent = chosen.length
+          ? chosen.length + " file" + (chosen.length === 1 ? "" : "s") + " \u00b7 " + formatBytes(bytes)
+          : "selected files";
+      }
+      if (selectAll) {
+        selectAll.checked = chosen.length > 0 && chosen.length === purgeChoices.length;
+        selectAll.indeterminate = chosen.length > 0 && chosen.length < purgeChoices.length;
+      }
+    };
+    purgeChoices.forEach((box) => box.addEventListener("change", syncSelection));
+    selectAll?.addEventListener("change", () => {
+      purgeChoices.forEach((box) => { box.checked = selectAll.checked; });
+      syncSelection();
+    });
+    syncSelection();
+  }
 
   class ResumableUpload {
     constructor(form) {
@@ -424,10 +546,36 @@
 
   const preview = document.querySelector("[data-preview-dialog]");
   if (preview) setupPreview(preview);
+  const palette = document.querySelector("[data-palette]");
+  if (palette) setupPalette(palette);
   const storageWarning = document.querySelector("[data-storage-warning]");
-  if (storageWarning) fetch("/api/v1/storage", { credentials: "same-origin", headers: { "Accept": "application/json" } })
+  const storageMeter = document.querySelector("[data-storage-meter]");
+  if (storageWarning || storageMeter) fetch("/api/v1/storage", { credentials: "same-origin", headers: { "Accept": "application/json" } })
     .then((response) => response.ok ? response.json() : null)
-    .then((status) => { if (status && (status.lowStorage || status.low_storage)) storageWarning.hidden = false; })
+    .then((status) => {
+      if (!status) return;
+      const low = Boolean(status.lowStorage || status.low_storage);
+      if (storageWarning && low) storageWarning.hidden = false;
+      if (!storageMeter) return;
+      const free = Number(status.freeBytes ?? status.free_bytes ?? 0);
+      const total = Number(status.totalBytes ?? status.total_bytes ?? 0);
+      const fill = storageMeter.querySelector("[data-storage-fill]");
+      const value = storageMeter.querySelector("[data-storage-free]");
+      const note = storageMeter.querySelector("[data-storage-note]");
+      if (total > 0) {
+        const ratio = Math.max(0, Math.min(1, (total - free) / total));
+        fill?.style.setProperty("--fill", (ratio * 100).toFixed(1) + "%");
+        if (value) value.textContent = Math.round(ratio * 100) + "% used";
+        if (note) note.textContent = formatBytes(free) + " free of " + formatBytes(total);
+        storageMeter.dataset.level = ratio > 0.92 ? "danger" : ratio > 0.8 ? "warn" : "ok";
+      } else {
+        fill?.style.setProperty("--fill", "12%");
+        if (value) value.textContent = formatBytes(free);
+        if (note) note.textContent = "free on the server";
+      }
+      if (low) storageMeter.dataset.level = "danger";
+      storageMeter.hidden = false;
+    })
     .catch(() => {});
   const purgeForm = document.querySelector("[data-storage-purge]");
   if (purgeForm) purgeForm.addEventListener("submit", async (event) => {
@@ -442,6 +590,176 @@
       toast("Selected files were permanently removed"); window.setTimeout(() => window.location.assign(response.url || "/storage"), 400);
     } catch (error) { toast(error.message || "Cleanup failed"); submit.disabled = false; }
   });
+
+  /* Command palette: jump to a page, or search the whole workspace. Text results
+     copy straight to the clipboard, files open their preview URL. */
+  function setupPalette(dialog) {
+    const input = dialog.querySelector("[data-palette-input]");
+    const results = dialog.querySelector("[data-palette-results]");
+    const apple = /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent || "");
+    document.querySelectorAll("[data-cmd-hint]").forEach((hint) => { hint.textContent = apple ? "\u2318K" : "Ctrl K"; });
+
+    const commands = [];
+    document.querySelectorAll(".side-link").forEach((link) => {
+      commands.push({
+        icon: link.querySelector("use")?.getAttribute("href") || "#i-arrow",
+        label: "Go to " + (link.querySelector("span")?.textContent || "").trim(),
+        hint: link.getAttribute("href"),
+        run: () => window.location.assign(link.getAttribute("href")),
+      });
+    });
+    if (document.querySelector("[data-capture-input]")) {
+      commands.push({
+        icon: "#i-plus", label: "New paste", hint: "compose",
+        run: () => {
+          document.getElementById("mode-paste")?.click();
+          document.querySelector("[data-capture-input]")?.focus();
+        },
+      });
+      commands.push({
+        icon: "#i-upload", label: "Upload a file", hint: "compose",
+        run: () => {
+          const mode = document.getElementById("mode-upload");
+          if (mode) mode.checked = true;
+          document.querySelector("[data-dropzone] input[type=file]")?.click();
+        },
+      });
+    }
+    commands.push({ icon: "#i-download", label: "Export vault as JSON", hint: "download", run: () => window.location.assign("/api/v1/items/export?format=json") });
+    commands.push({ icon: "#i-download", label: "Export vault as CSV", hint: "download", run: () => window.location.assign("/api/v1/items/export?format=csv") });
+    commands.push({
+      icon: "#i-moon", label: "Switch theme", hint: "appearance",
+      run: () => document.querySelector("[data-theme-toggle]")?.click(),
+    });
+    commands.push({ icon: "#i-logout", label: "Sign out", hint: "session", run: () => document.querySelector("[data-signout]")?.click() });
+
+    let rows = [];
+    let cursor = 0;
+    let token = 0;
+
+    const paint = () => {
+      rows.forEach((row, index) => row.node.setAttribute("aria-selected", String(index === cursor)));
+      rows[cursor]?.node.scrollIntoView({ block: "nearest" });
+    };
+    const addGroup = (name) => {
+      const heading = document.createElement("p");
+      heading.className = "palette-group";
+      heading.textContent = name;
+      results.append(heading);
+    };
+    const addRow = (entry) => {
+      const node = document.createElement("button");
+      node.type = "button";
+      node.className = "palette-item";
+      node.setAttribute("role", "option");
+      node.innerHTML = '<svg class="i" aria-hidden="true"><use href="' + entry.icon + '"></use></svg><strong></strong><small></small>';
+      node.querySelector("strong").textContent = entry.label;
+      node.querySelector("small").textContent = entry.hint || "";
+      node.addEventListener("click", () => { close(); entry.run(); });
+      node.addEventListener("mousemove", () => { cursor = rows.findIndex((row) => row.node === node); paint(); });
+      results.append(node);
+      rows.push({ node, run: entry.run });
+    };
+    const empty = (message) => {
+      const node = document.createElement("p");
+      node.className = "palette-empty";
+      node.textContent = message;
+      results.append(node);
+    };
+
+    const render = (term) => {
+      results.replaceChildren();
+      rows = [];
+      cursor = 0;
+      const needle = term.trim().toLowerCase();
+      if (needle) {
+        addGroup("Search");
+        addRow({
+          icon: "#i-search",
+          label: 'Search the vault for "' + term.trim() + '"',
+          hint: "enter",
+          run: () => window.location.assign("/?q=" + encodeURIComponent(term.trim())),
+        });
+      }
+      const matches = commands.filter((command) => !needle || command.label.toLowerCase().includes(needle));
+      if (matches.length) {
+        addGroup("Commands");
+        matches.slice(0, 8).forEach(addRow);
+      }
+      if (!needle) addGroup("Type to search stored items");
+      paint();
+    };
+
+    const lookup = async (term) => {
+      const mine = ++token;
+      try {
+        const response = await fetch("/api/v1/items?limit=6&q=" + encodeURIComponent(term), {
+          credentials: "same-origin",
+          headers: { "Accept": "application/json" },
+        });
+        if (!response.ok || mine !== token) return;
+        const data = await response.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (mine !== token || !items.length) return;
+        addGroup("In this workspace");
+        items.forEach((item) => {
+          const payload = item.textPayload ?? item.text_payload ?? null;
+          const name = item.originalFilename ?? item.original_filename ?? null;
+          const label = (name || (payload || "").split("\n").find((line) => line.trim()) || "Untitled").trim().slice(0, 68);
+          addRow({
+            icon: payload === null ? "#i-file" : "#i-text",
+            label,
+            hint: payload === null ? "open" : "copy",
+            run: async () => {
+              if (payload === null) {
+                window.open("/api/v1/items/" + encodeURIComponent(item.id) + "/content", "_blank", "noopener");
+                return;
+              }
+              try { await navigator.clipboard.writeText(payload); toast("Copied to your clipboard"); }
+              catch { toast("Your browser blocked copying"); }
+            },
+          });
+        });
+        paint();
+      } catch {
+        // Search is a convenience; the page search box still works.
+      }
+    };
+
+    let timer = 0;
+    const close = () => { if (dialog.open) dialog.close(); };
+    const open = () => {
+      if (dialog.open) return;
+      dialog.showModal();
+      input.value = "";
+      render("");
+      input.focus();
+    };
+
+    input?.addEventListener("input", () => {
+      const term = input.value;
+      render(term);
+      window.clearTimeout(timer);
+      if (term.trim().length > 1) timer = window.setTimeout(() => lookup(term.trim()), 200);
+    });
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown" || (event.key === "Tab" && !event.shiftKey)) {
+        event.preventDefault(); cursor = rows.length ? (cursor + 1) % rows.length : 0; paint();
+      } else if (event.key === "ArrowUp" || (event.key === "Tab" && event.shiftKey)) {
+        event.preventDefault(); cursor = rows.length ? (cursor - 1 + rows.length) % rows.length : 0; paint();
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        const chosen = rows[cursor];
+        if (chosen) { close(); chosen.run(); }
+      }
+    });
+    dialog.addEventListener("click", (event) => { if (event.target === dialog) close(); });
+    dialog.querySelector("[data-palette-close]")?.addEventListener("click", close);
+    document.querySelectorAll("[data-palette-open]").forEach((button) => button.addEventListener("click", open));
+    window.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); open(); }
+    });
+  }
 
   function setupPreview(dialog) {
     const title = dialog.querySelector("[data-preview-title]");
@@ -603,8 +921,12 @@
   function apiMessage(data) { return typeof data?.error === "string" ? data.error : data?.error?.message || data?.message || ""; }
   async function responseMessage(response, fallback) { const data = await response.json().catch(() => ({})); return apiMessage(data) || `${fallback} (${response.status})`; }
   function xhrMessage(xhr) { try { return apiMessage(JSON.parse(xhr.responseText)) || `Upload failed (${xhr.status})`; } catch { return `Upload failed (${xhr.status || "network error"})`; } }
+  let toastTimer = 0;
   function toast(message) {
     const element = document.getElementById("toast"); if (!element) return;
-    element.textContent = message; element.hidden = false; window.setTimeout(() => { element.hidden = true; }, 4000);
+    element.textContent = message;
+    element.hidden = false;
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => { element.hidden = true; }, 4000);
   }
 })();

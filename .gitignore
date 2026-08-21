@@ -17,3 +17,5 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+/preview_out/
+/clipboard_vault_redesign_system.html

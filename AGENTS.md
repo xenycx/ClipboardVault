@@ -55,7 +55,7 @@ A frontend change commonly touches both `templates/` and `static/`; read both fr
 2. Rust sends the session cookie to the private auth bridge.
 3. The auth service returns the user, approval status, active organization, role, and memberships.
 4. Rust authorizes the workspace, queries vault data, constructs an Askama template model, and renders HTML.
-5. `templates/base.html` loads `/static/app.css`, `/static/app.js`, and vendored preview libraries.
+5. `templates/base.html` loads `/static/theme.js` (blocking, so the stored theme is applied before first paint), `/static/app.css`, `/static/app.js`, and vendored preview libraries.
 
 ### Browser authentication request
 
@@ -83,8 +83,9 @@ A frontend change commonly touches both `templates/` and `static/`; read both fr
 - `auth/src/providers.ts`: typed social-provider credentials, scopes, and public metadata.
 - `auth/src/index.ts`: public auth mount and private bridge endpoints.
 - `templates/`: Askama HTML templates.
-- `static/app.css`: shared two-theme visual system.
-- `static/app.js`: browser behavior, auth forms, filtering, uploads, previews, and copy actions.
+- `static/app.css`: shared two-theme visual system and the application shell.
+- `static/app.js`: browser behavior, navigation, command palette, auth forms, filtering, uploads, previews, and copy actions.
+- `static/theme.js`: pre-paint theme selection; separate from `app.js` because the CSP forbids inline scripts.
 - `migrations/`: Rust-owned vault schema migrations.
 - `auth/migrations/`: auth-service schema material.
 - `nginx/`: public routing, request limits, and HTTPS configuration.
@@ -99,6 +100,10 @@ A frontend change commonly touches both `templates/` and `static/`; read both fr
 - Stream uploads and downloads. Preserve size ceilings, free-space reserve checks, safe paths, authoritative Tus offsets, and partial-file cleanup.
 - Sanitize rendered Markdown and HTML. Preserve sandboxing, restrictive security headers, forced downloads, and preview size limits.
 - Never commit `.env`, secrets, complete API keys, setup tokens, OAuth credentials, or production database URLs.
+- Never write inline `<script>` blocks or `on*=` handlers in templates. The page CSP is
+  `script-src 'self'` with no nonce, so inline JavaScript is silently dead in production.
+- Never reference `/static/...` from a template without the `|asset` filter. The fingerprint it
+  appends is what stops a browser from pairing new markup with a cached old stylesheet.
 
 ## Cross-layer change checklist
 

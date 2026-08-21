@@ -1,30 +1,82 @@
-{% extends "base.html" %}
-{% block title %}Storage · Clipboard Vault{% endblock %}
-{% block nav %}<nav class="nav"><a href="/">Vault</a><a href="/keys">Keys & team</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
+{% extends "app_base.html" %}
+{% block title %}Storage &middot; Clipboard Vault{% endblock %}
+{% block crumbs %}
+<h1 class="topbar-heading">Storage</h1>
+<span class="count-chip">{{ workspace_name }}</span>
+{% endblock %}
 {% block content %}
-<section class="page-heading"><span class="eyebrow">{{ workspace_name }}</span><h1>Storage</h1><p>Review capacity and permanently remove only the files you select. Clipboard Vault never deletes files automatically.</p></section>
-{% if low_storage %}<aside class="storage-warning" role="alert"><div><strong>Uploads are limited by low disk space.</strong><span>Free space must stay above the protected reserve.</span></div></aside>{% endif %}
-<section class="storage-metrics" aria-label="Storage summary">
-  <div class="storage-metric primary"><span class="muted">Workspace files</span><strong>{{ workspace_bytes|format_bytes }}</strong></div>
-  <div class="storage-metric"><span class="muted">Server free</span><strong>{{ free_bytes|format_bytes }}</strong></div>
-  <div class="storage-metric"><span class="muted">Protected reserve</span><strong>{{ reserve_bytes|format_bytes }}</strong></div>
-  <div class="storage-metric"><span class="muted">Reserved for uploads</span><strong>{{ reserved_upload_bytes|format_bytes }}</strong></div>
-  <div class="storage-metric"><span class="muted">In Trash, reclaimable by purging</span><strong>{{ reclaimable_bytes|format_bytes }}</strong></div>
+{% if low_storage %}
+<aside class="banner danger" role="alert">
+  <svg class="i" aria-hidden="true"><use href="#i-alert"/></svg>
+  <div><strong>Uploads are limited by low disk space.</strong><span>Free space must stay above the protected reserve before new transfers can start.</span></div>
+</aside>
+{% endif %}
+
+<section class="card gauge-card">
+  <div class="card-head">
+    <div><h2>Disk capacity</h2><p class="lede">Clipboard Vault never deletes files on its own. Everything below is removed only when you select it.</p></div>
+    {% if total_bytes > 0 %}<span class="count-chip">{{ used_bytes|format_bytes }} of {{ total_bytes|format_bytes }} used</span>{% endif %}
+  </div>
+  {% if total_bytes > 0 %}
+  <div class="gauge" data-gauge data-total="{{ total_bytes }}" data-used="{{ used_bytes }}" data-workspace="{{ workspace_bytes }}" role="img" aria-label="{{ used_bytes|format_bytes }} used of {{ total_bytes|format_bytes }}">
+    <span class="gauge-seg ws" data-gauge-ws></span>
+    <span class="gauge-seg other" data-gauge-other></span>
+  </div>
+  <ul class="legend">
+    <li><span class="dot ws"></span>This workspace<strong>{{ workspace_bytes|format_bytes }}</strong></li>
+    <li><span class="dot other"></span>Everything else on disk<strong>{{ other_bytes|format_bytes }}</strong></li>
+    <li><span class="dot free"></span>Free<strong>{{ free_bytes|format_bytes }}</strong></li>
+  </ul>
+  {% endif %}
+  <div class="stat-grid">
+    <div class="stat"><span>Workspace files</span><strong>{{ workspace_bytes|format_bytes }}</strong></div>
+    <div class="stat"><span>Server free</span><strong>{{ free_bytes|format_bytes }}</strong></div>
+    <div class="stat"><span>Protected reserve</span><strong>{{ reserve_bytes|format_bytes }}</strong></div>
+    <div class="stat"><span>Reserved by uploads in flight</span><strong>{{ reserved_upload_bytes|format_bytes }}</strong></div>
+    <div class="stat accent"><span>In trash, reclaimable</span><strong>{{ reclaimable_bytes|format_bytes }}</strong></div>
+  </div>
 </section>
-<form action="/storage/purge" method="post" class="panel stack" data-storage-purge>
-  <div class="panel-heading"><div><h2>Choose files to purge</h2><p class="muted">Trashed files are listed first, followed by the oldest and largest files.</p></div><span>{{ cleanup_items.len() }} files</span></div>
-  <div class="table-wrap"><table class="storage-list"><thead><tr><th>Select</th><th>File</th><th>Status</th><th>Stored</th><th>Can reclaim</th><th>Created</th></tr></thead><tbody>
-    {% for item in cleanup_items %}<tr>
-      <td><input type="checkbox" name="item_ids" value="{{ item.id }}" aria-label="Select {{ item.filename }}"></td>
-      <td><strong>{{ item.filename }}</strong></td>
-      <td>{% if item.deleted %}<span class="status rejected">Trash</span>{% else %}<span class="status approved">Active</span>{% endif %}</td>
-      <td>{{ item.size_bytes|format_bytes }}</td><td>{{ item.reclaimable_bytes|format_bytes }}</td><td>{{ item.created_at }}</td>
-    </tr>{% endfor %}
-  </tbody></table></div>
-  {% if cleanup_items.is_empty() %}<p class="muted">There are no files available for cleanup.</p>{% endif %}
-  <p class="reclaim-note">Duplicate files may reclaim fewer bytes than their displayed size until the final reference is removed.</p>
-  <label>Type <strong>{{ workspace_name }}</strong> to confirm<input name="confirmation" required autocomplete="off" aria-describedby="purge-warning"></label>
-  <p id="purge-warning" class="muted">This permanently removes the selected files and cannot be undone.</p>
-  <button class="button danger" type="submit">Permanently purge selected files</button>
+
+<form action="/storage/purge" method="post" class="card" data-storage-purge>
+  <div class="card-head">
+    <div><h2>Permanent cleanup</h2><p class="lede">Trashed files are listed first, then the largest and oldest. Purging cannot be undone.</p></div>
+    <span class="count-chip">{{ cleanup_items.len() }} files</span>
+  </div>
+  {% if cleanup_items.is_empty() %}
+  <div class="empty inline">
+    <span class="empty-art" aria-hidden="true"><svg class="i"><use href="#i-database"/></svg></span>
+    <h3>Nothing to clean up</h3>
+    <p>This workspace has no stored files yet, so there is nothing to reclaim.</p>
+  </div>
+  {% else %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th class="tight"><label class="checkbox"><input type="checkbox" data-select-all aria-label="Select every file"><span></span></label></th>
+          <th>File</th><th>Status</th><th class="num">Stored</th><th class="num">Can reclaim</th><th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in cleanup_items %}
+        <tr>
+          <td class="tight"><label class="checkbox"><input type="checkbox" name="item_ids" value="{{ item.id }}" data-purge-item data-bytes="{{ item.reclaimable_bytes }}" aria-label="Select {{ item.filename }}"><span></span></label></td>
+          <td><span class="cell-strong">{{ item.filename }}</span></td>
+          <td>{% if item.deleted %}<span class="status rejected">Trash</span>{% else %}<span class="status approved">Active</span>{% endif %}</td>
+          <td class="num mono">{{ item.size_bytes|format_bytes }}</td>
+          <td class="num mono">{{ item.reclaimable_bytes|format_bytes }}</td>
+          <td class="mono subtle">{{ item.created_at.format("%Y-%m-%d") }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="note"><svg class="i" aria-hidden="true"><use href="#i-alert"/></svg>Duplicate files reclaim nothing until the final copy that references them is removed.</p>
+  <div class="purge-foot">
+    <label class="field grow">Type <strong>{{ workspace_name }}</strong> to confirm<input name="confirmation" required autocomplete="off" placeholder="{{ workspace_name }}" aria-describedby="purge-warning"></label>
+    <button class="button danger" type="submit"><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg>Purge <span data-purge-summary>selected files</span></button>
+  </div>
+  <p id="purge-warning" class="note subtle">This permanently removes the selected files from disk and cannot be undone.</p>
+  {% endif %}
 </form>
 {% endblock %}

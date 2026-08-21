@@ -21,6 +21,7 @@ use crate::{
     filters,
     models::{AuthContext, BridgeSession, ItemCreate, ItemRow},
 };
+use sqlx::{Postgres, QueryBuilder};
 
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -41,9 +42,28 @@ struct SetupTemplate;
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
     session: BridgeSession,
-    active_workspace_name: String,
     items: Vec<ItemRow>,
     max_upload_mb: u64,
+    nav: &'static str,
+    query: String,
+    trash: bool,
+    chips: Vec<FilterChip>,
+}
+
+/// One type filter in the vault toolbar. Hrefs are built server side so the
+/// browser never has to guess how to escape a search term.
+struct FilterChip {
+    label: String,
+    href: String,
+    count: i64,
+    active: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VaultQuery {
+    q: Option<String>,
+    kind: Option<String>,
+    trash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -68,6 +88,8 @@ struct KeyList {
 #[derive(Template)]
 #[template(path = "keys.html")]
 struct KeysTemplate {
+    session: BridgeSession,
+    nav: &'static str,
     workspace_name: String,
     keys: Vec<ApiKeySummary>,
     members: Vec<WorkspaceMember>,
@@ -113,14 +135,22 @@ struct AdminUsers {
 #[derive(Template)]
 #[template(path = "admin.html")]
 struct AdminTemplate {
+    session: BridgeSession,
+    nav: &'static str,
     users: Vec<AdminUser>,
+    pending: usize,
 }
 
 #[derive(Template)]
 #[template(path = "storage.html")]
 pub struct StorageTemplate {
+    pub session: BridgeSession,
+    pub nav: &'static str,
     pub workspace_name: String,
     pub free_bytes: u64,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub other_bytes: u64,
     pub reserve_bytes: u64,
     pub workspace_bytes: i64,
     pub reserved_upload_bytes: i64,
@@ -210,7 +240,11 @@ pub async fn pending(State(state): State<AppState>, headers: HeaderMap) -> AppRe
     .into_response())
 }
 
-pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
+pub async fn dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<VaultQuery>,
+) -> AppResult<Response> {
     let session = match state
         .auth
         .session(&headers, workspace_cookie(&headers))
@@ -227,15 +261,50 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> App
         .active_organization_id
         .clone()
         .ok_or(AppError::Forbidden)?;
-    let workspace_name = session
-        .memberships
-        .iter()
-        .find(|m| m.organization_id == organization_id)
-        .map(|m| m.organization_name.clone())
-        .unwrap_or_else(|| "Workspace".into());
-    let items = sqlx::query_as::<_, ItemRow>(
-        "SELECT * FROM vault_items WHERE organization_id = $1 AND deleted_at IS NULL ORDER BY pinned DESC, created_at DESC LIMIT 100",
-    ).bind(&organization_id).fetch_all(&state.pool).await?;
+    let trash = query
+        .trash
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
+    let search = query.q.unwrap_or_default().trim().to_string();
+    let kind = query
+        .kind
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(16)
+        .collect::<String>();
+    let kind_filter = (!kind.is_empty() && kind != "all").then(|| kind.clone());
+
+    let mut builder =
+        QueryBuilder::<Postgres>::new("SELECT * FROM vault_items WHERE organization_id = ");
+    builder.push_bind(&organization_id);
+    builder.push(if trash {
+        " AND deleted_at IS NOT NULL"
+    } else {
+        " AND deleted_at IS NULL"
+    });
+    if let Some(kind) = kind_filter.as_ref() {
+        builder.push(" AND kind = ").push_bind(kind.clone());
+    }
+    api::push_search(&mut builder, &search);
+    builder.push(" ORDER BY pinned DESC, created_at DESC LIMIT 100");
+    let items = builder
+        .build_query_as::<ItemRow>()
+        .fetch_all(&state.pool)
+        .await?;
+
+    let counts = sqlx::query_as::<_, (String, i64)>(if trash {
+        "SELECT kind, count(*) FROM vault_items WHERE organization_id = $1 AND deleted_at IS NOT NULL GROUP BY kind"
+    } else {
+        "SELECT kind, count(*) FROM vault_items WHERE organization_id = $1 AND deleted_at IS NULL GROUP BY kind"
+    })
+    .bind(&organization_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let chips = build_chips(&counts, kind_filter.as_deref(), &search, trash);
+
     let limit = sqlx::query_scalar::<_, i64>(
         "SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id = $1",
     )
@@ -245,11 +314,66 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> App
     .unwrap_or(104_857_600) as u64;
     Ok(render(DashboardTemplate {
         session,
-        active_workspace_name: workspace_name,
         items,
         max_upload_mb: limit.min(state.server_max_upload_bytes) / 1024 / 1024,
+        nav: if trash { "trash" } else { "vault" },
+        query: search,
+        trash,
+        chips,
     })?
     .into_response())
+}
+
+/// Vault filter link, e.g. `/?trash=1&kind=code&q=deploy`.
+fn vault_href(kind: Option<&str>, search: &str, trash: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if trash {
+        parts.push("trash=1".to_string());
+    }
+    if let Some(kind) = kind {
+        parts.push(format!("kind={}", urlencoding(kind)));
+    }
+    if !search.is_empty() {
+        parts.push(format!("q={}", urlencoding(search)));
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", parts.join("&"))
+    }
+}
+
+/// `All` plus one chip per kind present in the current view, in a stable order.
+fn build_chips(
+    counts: &[(String, i64)],
+    active_kind: Option<&str>,
+    search: &str,
+    trash: bool,
+) -> Vec<FilterChip> {
+    const ORDER: [&str; 6] = ["text", "code", "url", "html", "image", "file"];
+    let total: i64 = counts.iter().map(|(_, count)| count).sum();
+    let mut chips = vec![FilterChip {
+        label: "All".to_string(),
+        href: vault_href(None, search, trash),
+        count: total,
+        active: active_kind.is_none(),
+    }];
+    let mut present: Vec<&(String, i64)> = counts.iter().filter(|(_, count)| *count > 0).collect();
+    present.sort_by_key(|(kind, _)| {
+        ORDER
+            .iter()
+            .position(|known| known == kind)
+            .unwrap_or(ORDER.len())
+    });
+    for (kind, count) in present {
+        chips.push(FilterChip {
+            label: kind.clone(),
+            href: vault_href(Some(kind), search, trash),
+            count: *count,
+            active: active_kind == Some(kind.as_str()),
+        });
+    }
+    chips
 }
 
 pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
@@ -281,6 +405,8 @@ pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResul
     let can_manage = matches!(active_role, "owner" | "admin");
     let is_owner = active_role == "owner";
     Ok(render(KeysTemplate {
+        session,
+        nav: "keys",
         workspace_name,
         keys: list.keys,
         members: details.members,
@@ -300,9 +426,16 @@ pub async fn storage_page(
     let auth = page_auth_context(&session)?;
     api::require_workspace_manager(&auth)?;
     let details = api::storage_details(&state, &auth).await?;
+    let used_bytes = details.total_bytes.saturating_sub(details.free_bytes);
+    let other_bytes = used_bytes.saturating_sub(details.workspace_bytes.max(0) as u64);
     Ok(render(StorageTemplate {
+        session,
+        nav: "storage",
         workspace_name: details.workspace_name,
         free_bytes: details.free_bytes,
+        total_bytes: details.total_bytes,
+        used_bytes,
+        other_bytes,
         reserve_bytes: details.reserve_bytes,
         workspace_bytes: details.workspace_bytes,
         reserved_upload_bytes: details.reserved_upload_bytes,
@@ -361,8 +494,25 @@ pub async fn admin(State(state): State<AppState>, headers: HeaderMap) -> AppResu
         "/internal/admin/users?requesterId={}",
         urlencoding(&session.user.id)
     );
-    let users: AdminUsers = state.auth.get_json(&path, &[]).await?;
-    Ok(render(AdminTemplate { users: users.users })?.into_response())
+    let payload: AdminUsers = state.auth.get_json(&path, &[]).await?;
+    let mut users = payload.users;
+    // Anything waiting on a decision belongs at the top of the queue.
+    users.sort_by_key(|user| match user.approval_status.as_str() {
+        "pending" => 0,
+        "approved" => 1,
+        _ => 2,
+    });
+    let pending = users
+        .iter()
+        .filter(|user| user.approval_status == "pending")
+        .count();
+    Ok(render(AdminTemplate {
+        session,
+        nav: "admin",
+        users,
+        pending,
+    })?
+    .into_response())
 }
 
 pub async fn reset_password(
@@ -824,4 +974,50 @@ fn render(template: impl Template) -> AppResult<Html<String>> {
             .render()
             .map_err(|error| AppError::Other(error.into()))?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_pages_request_versioned_assets() {
+        let html = LoginTemplate.render().unwrap();
+        for asset in [
+            "/static/app.css?v=",
+            "/static/app.js?v=",
+            "/static/theme.js?v=",
+        ] {
+            assert!(html.contains(asset), "{asset} is missing from the head");
+        }
+    }
+
+    #[test]
+    fn rendered_pages_carry_no_inline_script() {
+        // script-src 'self' means an inline script or handler silently does nothing.
+        let html = LoginTemplate.render().unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("onclick="));
+        assert!(!html.contains("onchange="));
+    }
+
+    #[test]
+    fn vault_links_escape_the_search_term() {
+        let href = vault_href(Some("code"), "a&b c", true);
+        assert_eq!(href, "/?trash=1&kind=code&q=a%26b+c");
+        assert_eq!(vault_href(None, "", false), "/");
+    }
+
+    #[test]
+    fn chips_lead_with_an_all_entry_that_totals_the_view() {
+        let counts = vec![("code".to_string(), 3), ("text".to_string(), 5)];
+        let chips = build_chips(&counts, Some("code"), "", false);
+        assert_eq!(chips[0].label, "All");
+        assert_eq!(chips[0].count, 8);
+        assert!(!chips[0].active);
+        // Fixed display order regardless of how Postgres grouped them.
+        assert_eq!(chips[1].label, "text");
+        assert_eq!(chips[2].label, "code");
+        assert!(chips[2].active);
+    }
 }

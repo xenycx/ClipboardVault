@@ -1,15 +1,18 @@
-{% extends "base.html" %}
-{% block title %}Account review · Clipboard Vault{% endblock %}
-{% block content %}
-<section class="center-card panel">
+{% extends "auth_base.html" %}
+{% block title %}Account review &middot; Clipboard Vault{% endblock %}
+{% block auth_title %}{% if rejected %}This account was not approved.{% else %}You are on the approval list.{% endif %}{% endblock %}
+{% block auth_lede %}Every account on this server is reviewed by an administrator before it can open a workspace.{% endblock %}
+{% block auth_card %}
+<div class="card auth-card centered">
   {% if rejected %}
-  <span class="status rejected">Not approved</span><h1>Access was not approved</h1>
+  <span class="status rejected"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg>Not approved</span>
+  <h2>Access was not approved</h2>
   <p>Ask the server administrator if you believe this is a mistake.</p>
   {% else %}
-  <span class="status pending">Pending</span><h1>Welcome, {{ name }}</h1>
-  <p>Your login works. A global administrator must approve the account before it can see any workspace.</p>
+  <span class="status pending"><svg class="i" aria-hidden="true"><use href="#i-clock"/></svg>Pending review</span>
+  <h2>Welcome, {{ name }}</h2>
+  <p>Your login works. A global administrator must approve this account before it can see any workspace.</p>
   {% endif %}
-  <button class="button" type="button" data-signout>Sign out</button>
-</section>
+  <button class="button quiet block" type="button" data-signout><svg class="i" aria-hidden="true"><use href="#i-logout"/></svg>Sign out</button>
+</div>
 {% endblock %}
-

@@ -147,6 +147,37 @@ bootstrap token afterward and restart the auth service:
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate auth
 ```
 
+## 8. Verify the interface
+
+Every page is rendered by the server, so a bad deployment is visible in a browser
+immediately. Walk this list after the first start and after every upgrade.
+
+1. Open `/login`. The split sign-in screen shows the product panel beside the card, and the
+   page must not flash the wrong theme while loading.
+2. Sign in and open the vault. The sidebar, workspace switcher, and Paste/Upload composer
+   render, and the top bar shows the search button.
+3. Press `Ctrl K` (`Cmd K` on macOS). The command palette opens and lists navigation commands.
+4. Save a short paste. It appears as a card showing its type, size, and age.
+5. Upload a file larger than one chunk and confirm progress, pause, and resume.
+6. Delete that item, open Trash in the sidebar, and restore it.
+7. As a workspace owner or admin, open Storage. The capacity gauge and the sidebar disk meter
+   show real numbers.
+8. Switch the theme in the top bar, reload, and confirm the choice survives.
+
+Then confirm the browser is being sent the current assets:
+
+```bash
+curl -sI https://vault.example.com/static/app.css | grep -i cache-control
+curl -s https://vault.example.com/login | grep -o "/static/app.css?v=[a-f0-9]*"
+```
+
+The stylesheet must return `cache-control: public, max-age=31536000, immutable`, and the page
+must reference a `?v=` fingerprint. That fingerprint is a hash of everything in `static/`,
+computed when the container starts. Because it changes with the assets, a browser never pairs
+freshly rendered markup with a cached copy of the previous stylesheet, and unchanged assets
+stay cached across restarts. Rendered pages themselves are sent with `cache-control: no-store`
+so workspace content is not written to a shared or on-disk cache.
+
 ## Operations
 
 ### Status and logs
@@ -173,6 +204,13 @@ Permanent purge is irreversible, and a code rollback cannot recover deleted Post
 rows or file bytes.
 
 ### Upgrade
+
+Frontend releases carry no database or configuration change. The Rust binary compiles the
+Askama templates, and the runtime image ships `static/`, so a normal image upgrade replaces the
+interface atomically. The asset fingerprint changes with the files, so browsers pull the new
+stylesheet and script on their next request. Ask anyone with a tab already open to reload it
+once; an old tab keeps running the old script until it does. Rolling the image back restores
+the previous interface the same way, with no data conversion in either direction.
 
 Routine releases use the guarded operator command. Run the read-only preflight first, then
 deploy the same tested tag or commit:
@@ -271,3 +309,16 @@ pg_restore --list backups/postgres-<timestamp>.dump
   complete or completely blank.
 - Certificate request fails: confirm DNS, ports 80/443, firewall rules, and that no other service
   owns those ports.
+- The interface loads unstyled or misaligned: the image is missing its assets or the browser
+  kept an old stylesheet. Confirm the files shipped with
+  `docker compose exec vault ls static`, then confirm the page requests a fingerprinted URL with
+  `curl -s https://vault.example.com/login | grep -o "/static/app.css?v=[a-f0-9]*"`. A page that
+  requests `/static/app.css` with no `?v=` is being served by an older build.
+- The theme flashes on every page load: `/static/theme.js` is not being served. It must load
+  before the stylesheet and must stay a separate file, because the page CSP forbids inline
+  scripts.
+- Buttons, the workspace switcher, uploads, or the command palette do nothing: check the browser
+  console for CSP violations. `script-src 'self'` means an inline `<script>` block or an
+  `onclick=` attribute is silently ignored; behavior belongs in `/static/app.js`.
+- The sidebar disk meter never appears: it is rendered only for workspace owners and admins,
+  because `/api/v1/storage` requires that role. This is expected for members.

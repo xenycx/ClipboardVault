@@ -1,4 +1,17 @@
-{% extends "base.html" %}
-{% block title %}Join workspace · Clipboard Vault{% endblock %}
-{% block content %}<section class="center-card panel"><span class="eyebrow">PRIVATE INVITATION</span><h1>Join this workspace</h1>{% if signed_in %}<p>This one-time invitation will add your approved account to the workspace.</p><form method="post"><button class="button primary" type="submit">Accept invitation</button></form>{% else %}<p>Sign in and wait for account approval before accepting this invitation.</p><a class="button primary" href="/login?returnTo=/join/{{ token }}">Sign in</a>{% endif %}</section>{% endblock %}
-
+{% extends "auth_base.html" %}
+{% block title %}Join workspace &middot; Clipboard Vault{% endblock %}
+{% block auth_title %}You were invited to a workspace.{% endblock %}
+{% block auth_lede %}Invitations are single use and expire 48 hours after they are created.{% endblock %}
+{% block auth_card %}
+<div class="card auth-card centered">
+  <span class="status pending"><svg class="i" aria-hidden="true"><use href="#i-users"/></svg>Private invitation</span>
+  <h2>Join this workspace</h2>
+  {% if signed_in %}
+  <p>This one-time invitation will add your approved account to the workspace.</p>
+  <form method="post"><button class="button primary block" type="submit">Accept invitation<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></button></form>
+  {% else %}
+  <p>Sign in and wait for account approval before accepting this invitation.</p>
+  <a class="button primary block" href="/login?returnTo=/join/{{ token }}">Sign in<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+  {% endif %}
+</div>
+{% endblock %}

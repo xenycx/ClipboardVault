@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block body_class %}app{% endblock %}
+{% block layout %}
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="frame" data-frame>
+  <button class="scrim" type="button" data-nav-scrim tabindex="-1" aria-label="Close navigation"></button>
+  <aside class="sidebar" id="sidebar" data-sidebar>
+    <div class="side-head">
+      <a class="brand" href="/">
+        <span class="brand-mark"><svg class="i" aria-hidden="true"><use href="#i-logo"/></svg></span>
+        <span class="brand-name">Clipboard <b>Vault</b></span>
+      </a>
+      <button class="icon-btn hide-desk" type="button" data-nav-close aria-label="Close navigation"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </div>
+
+    <form class="ws" action="/workspaces/switch" method="post" data-workspace-form>
+      <span class="side-label">Workspace</span>
+      <div class="ws-field">
+        <span class="ws-avatar" data-ws-avatar aria-hidden="true"></span>
+        <label class="sr-only" for="ws-select">Active workspace</label>
+        <select id="ws-select" name="organization_id" data-workspace-select>
+          {% for membership in session.memberships %}<option value="{{ membership.organization_id }}" {% if membership.organization_id == session.active_organization_id.as_deref().unwrap_or("") %}selected{% endif %}>{{ membership.organization_name }}</option>{% endfor %}
+        </select>
+        <svg class="i ws-caret" aria-hidden="true"><use href="#i-chevron"/></svg>
+      </div>
+      <button class="button quiet block" type="submit" data-workspace-submit>Switch workspace</button>
+    </form>
+
+    <nav class="side-nav" aria-label="Primary">
+      <span class="side-label">Library</span>
+      <a class="side-link" href="/" {% if nav == "vault" %}aria-current="page"{% endif %}><svg class="i" aria-hidden="true"><use href="#i-vault"/></svg><span>Vault</span></a>
+      <a class="side-link" href="/?trash=1" {% if nav == "trash" %}aria-current="page"{% endif %}><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg><span>Trash</span></a>
+      <span class="side-label">Workspace</span>
+      <a class="side-link" href="/keys" {% if nav == "keys" %}aria-current="page"{% endif %}><svg class="i" aria-hidden="true"><use href="#i-key"/></svg><span>Keys &amp; team</span></a>
+      {% if session.active_role.as_deref().unwrap_or("member") != "member" %}<a class="side-link" href="/storage" {% if nav == "storage" %}aria-current="page"{% endif %}><svg class="i" aria-hidden="true"><use href="#i-database"/></svg><span>Storage</span></a>{% endif %}
+      {% if session.user.role.contains("admin") %}<span class="side-label">Server</span>
+      <a class="side-link" href="/admin" {% if nav == "admin" %}aria-current="page"{% endif %}><svg class="i" aria-hidden="true"><use href="#i-shield"/></svg><span>Accounts</span></a>{% endif %}
+    </nav>
+
+    <div class="side-foot">
+      {% if session.active_role.as_deref().unwrap_or("member") != "member" %}
+      <a class="meter-card" href="/storage" data-storage-meter hidden>
+        <span class="meter-top"><span class="meter-name">Server disk</span><span class="meter-value" data-storage-free>—</span></span>
+        <span class="meter-track"><span class="meter-fill" data-storage-fill></span></span>
+        <span class="meter-note" data-storage-note>free space</span>
+      </a>
+      {% endif %}
+      <div class="user-chip">
+        <span class="avatar" aria-hidden="true">{{ session.user.name.chars().next().unwrap_or('?') }}</span>
+        <span class="user-copy"><strong>{{ session.user.name }}</strong><small>{{ session.user.email }}</small></span>
+        <button class="icon-btn" type="button" data-signout aria-label="Sign out" title="Sign out"><svg class="i" aria-hidden="true"><use href="#i-logout"/></svg></button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="app-main">
+    <header class="topbar">
+      <button class="icon-btn hide-desk" type="button" data-nav-open aria-label="Open navigation" aria-controls="sidebar"><svg class="i" aria-hidden="true"><use href="#i-menu"/></svg></button>
+      <div class="topbar-title">{% block crumbs %}{% endblock %}</div>
+      <div class="topbar-actions">
+        <button class="cmd-trigger" type="button" data-palette-open>
+          <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+          <span>Search vault</span>
+          <kbd class="kbd" data-cmd-hint>Ctrl K</kbd>
+        </button>
+        {% block topbar_actions %}{% endblock %}
+        <button class="icon-btn theme-btn" type="button" data-theme-toggle aria-label="Switch theme" title="Switch theme">
+          <svg class="i icon-dark" aria-hidden="true"><use href="#i-moon"/></svg>
+          <svg class="i icon-light" aria-hidden="true"><use href="#i-sun"/></svg>
+        </button>
+      </div>
+    </header>
+    <main class="page" id="main">{% block content %}{% endblock %}</main>
+  </div>
+</div>
+
+<dialog class="palette" data-palette aria-label="Search and commands">
+  <div class="palette-head">
+    <svg class="i" aria-hidden="true"><use href="#i-search"/></svg>
+    <input type="search" class="palette-input" data-palette-input placeholder="Search the vault, or jump to a page…" aria-label="Search the vault or jump to a page" autocomplete="off" spellcheck="false">
+    <button class="icon-btn" type="button" data-palette-close aria-label="Close search"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg></button>
+  </div>
+  <div class="palette-body" data-palette-results role="listbox" aria-label="Results"></div>
+  <div class="palette-foot">
+    <span><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> navigate</span>
+    <span><kbd class="kbd">↵</kbd> open</span>
+    <span><kbd class="kbd">Esc</kbd> close</span>
+  </div>
+</dialog>
+{% endblock %}

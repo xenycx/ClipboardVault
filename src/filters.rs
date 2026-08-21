@@ -2,6 +2,14 @@ use askama::Values;
 
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
+/// Appends the build's asset fingerprint to a `/static` URL.
+///
+/// Used by `templates/base.html` so that upgrading the server also invalidates
+/// every cached stylesheet and script.
+pub fn asset(path: &str, _: &dyn Values) -> askama::Result<String> {
+    Ok(format!("{path}?v={}", crate::asset_version()))
+}
+
 /// Human-readable byte formatting for Askama templates, mirroring `formatBytes()` in
 /// `static/app.js` so server-rendered and JS-rendered values agree.
 pub fn format_bytes<T>(value: &T, _: &dyn Values) -> askama::Result<String>

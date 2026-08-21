@@ -1,13 +1,49 @@
-{% extends "base.html" %}
-{% block title %}Account approvals · Clipboard Vault{% endblock %}
-{% block nav %}<nav class="nav"><a href="/">Vault</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
+{% extends "app_base.html" %}
+{% block title %}Account approvals &middot; Clipboard Vault{% endblock %}
+{% block crumbs %}
+<h1 class="topbar-heading">Accounts</h1>
+{% if pending > 0 %}<span class="count-chip warn">{{ pending }} waiting</span>{% else %}<span class="count-chip">{{ users.len() }} total</span>{% endif %}
+{% endblock %}
 {% block content %}
-<section class="page-heading"><span class="eyebrow">GLOBAL ADMINISTRATION</span><h1>Account approvals</h1><p>Approving an account creates its personal workspace. Invited accounts still require approval.</p></section>
-<section class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>User</th><th>Status</th><th>Global role</th><th>Created</th><th>Actions</th></tr></thead><tbody>
-{% for user in users %}<tr><td><strong>{{ user.name }}</strong><br><span class="muted">{{ user.email }}</span></td><td><span class="status {{ user.approval_status }}">{{ user.approval_status }}</span></td><td>{{ user.role }}</td><td>{{ user.created_at }}</td><td class="actions-cell">
-{% if user.approval_status != "approved" %}<form action="/admin/users/{{ user.id }}/approve" method="post"><button class="link-button" type="submit">Approve</button></form>{% endif %}
-{% if user.approval_status != "rejected" && !user.role.contains("admin") %}<form action="/admin/users/{{ user.id }}/reject" method="post"><button class="link-button danger" type="submit">Reject</button></form>{% endif %}
-<form action="/admin/users/{{ user.id }}/reset" method="post"><button class="link-button" type="submit">Reset password</button></form>
-</td></tr>{% endfor %}
-</tbody></table></div></section>
+<section class="card">
+  <div class="card-head">
+    <div><h2>Account approvals</h2><p class="lede">Approving an account creates its personal workspace. Invited accounts still need approval here.</p></div>
+    <span class="count-chip">{{ users.len() }} accounts</span>
+  </div>
+  {% if users.is_empty() %}
+  <div class="empty inline">
+    <span class="empty-art" aria-hidden="true"><svg class="i"><use href="#i-users"/></svg></span>
+    <h3>No accounts yet</h3>
+    <p>The first person to register will appear here for review.</p>
+  </div>
+  {% else %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead><tr><th>User</th><th>Status</th><th>Global role</th><th>Created</th><th class="num">Actions</th></tr></thead>
+      <tbody>
+        {% for user in users %}
+        <tr>
+          <td>
+            <span class="person">
+              <span class="avatar" aria-hidden="true">{{ user.name.chars().next().unwrap_or('?') }}</span>
+              <span><span class="cell-strong">{{ user.name }}</span><small>{{ user.email }}</small></span>
+            </span>
+          </td>
+          <td><span class="status {{ user.approval_status }}">{{ user.approval_status }}</span></td>
+          <td>{% if user.role.contains("admin") %}<span class="pill role-admin">admin</span>{% else %}<span class="pill">member</span>{% endif %}</td>
+          <td class="mono subtle">{{ user.created_at }}</td>
+          <td class="num">
+            <div class="row-actions">
+              {% if user.approval_status != "approved" %}<form action="/admin/users/{{ user.id }}/approve" method="post"><button class="link-btn ok" type="submit">Approve</button></form>{% endif %}
+              {% if user.approval_status != "rejected" && !user.role.contains("admin") %}<form action="/admin/users/{{ user.id }}/reject" method="post"><button class="link-btn danger" type="submit">Reject</button></form>{% endif %}
+              <form action="/admin/users/{{ user.id }}/reset" method="post"><button class="link-btn" type="submit">Reset password</button></form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
 {% endblock %}

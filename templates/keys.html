@@ -1,36 +1,137 @@
-{% extends "base.html" %}
-{% block title %}Keys and team · Clipboard Vault{% endblock %}
-{% block nav %}<nav class="nav"><a href="/">Vault</a><a href="/storage">Storage</a><button class="link-button" type="button" data-signout>Sign out</button></nav>{% endblock %}
+{% extends "app_base.html" %}
+{% block title %}Keys and team &middot; Clipboard Vault{% endblock %}
+{% block crumbs %}
+<h1 class="topbar-heading">Keys &amp; team</h1>
+<span class="count-chip">{{ workspace_name }}</span>
+{% endblock %}
 {% block content %}
-<section class="page-heading"><span class="eyebrow">{{ workspace_name }}</span><h1>Automation and access</h1><p>Keys are tied to this workspace. The complete key is shown only once.</p></section>
-<div class="two-column">
-  <section class="panel"><h2>Create API key</h2><form action="/keys/create" method="post" class="stack">
-    <label>Name<input name="name" placeholder="Laptop uploader" required maxlength="80"></label>
-    <label>Expires after<select name="expires_in_days"><option value="30">30 days</option><option value="90" selected>90 days</option><option value="365">1 year</option></select></label>
-    <label class="check"><input type="checkbox" name="read"> Allow reading items</label>
-    <label class="check"><input type="checkbox" name="delete"> Allow deleting items</label>
-    <button class="button primary" type="submit">Create key</button>
-  </form></section>
-  {% if can_manage %}<section class="panel"><h2>Invite a teammate</h2><p>Create a private link and send it yourself. It expires after 48 hours.</p>
-    <form action="/invitations/create" method="post" class="stack"><label>Role<select name="role"><option value="member">Member</option><option value="admin">Workspace admin</option></select></label><button class="button" type="submit">Create invitation</button></form>
-  </section>{% endif %}
+<div class="col-2">
+  <section class="card">
+    <div class="card-head"><div><h2>Create an API key</h2><p class="lede">Keys belong to this workspace. The full key is shown exactly once.</p></div></div>
+    <form action="/keys/create" method="post" class="stack">
+      <label class="field">Name<input name="name" placeholder="Laptop uploader" required maxlength="80"></label>
+      <label class="field">Expires after
+        <select name="expires_in_days">
+          <option value="30">30 days</option>
+          <option value="90" selected>90 days</option>
+          <option value="365">1 year</option>
+        </select>
+      </label>
+      <fieldset class="perm-set">
+        <legend>Permissions</legend>
+        <p class="perm-row static"><span><strong>Write</strong><small>Create items and upload files</small></span><span class="status approved">Always on</span></p>
+        <label class="perm-row"><span><strong>Read</strong><small>List and download stored items</small></span><input type="checkbox" name="read" class="switch"></label>
+        <label class="perm-row"><span><strong>Delete</strong><small>Move items to trash and restore them</small></span><input type="checkbox" name="delete" class="switch"></label>
+      </fieldset>
+      <button class="button primary" type="submit"><svg class="i" aria-hidden="true"><use href="#i-key"/></svg>Create key</button>
+    </form>
+  </section>
+
+  <div class="stack-cards">
+    {% if can_manage %}
+    <section class="card">
+      <div class="card-head"><div><h2>Invite a teammate</h2><p class="lede">Creates a private link you send yourself. It expires after 48 hours.</p></div></div>
+      <form action="/invitations/create" method="post" class="stack">
+        <label class="field">Role
+          <select name="role"><option value="member">Member</option><option value="admin">Workspace admin</option></select>
+        </label>
+        <button class="button" type="submit"><svg class="i" aria-hidden="true"><use href="#i-users"/></svg>Create invitation</button>
+      </form>
+    </section>
+    <section class="card">
+      <div class="card-head"><div><h2>Upload ceiling</h2><p class="lede">Applies to everyone in this workspace, up to the server maximum of {{ server_max_upload_mb }} MiB.</p></div></div>
+      <form action="/workspaces/settings" method="post" class="row-form">
+        <label class="field grow">Maximum upload (MB)<input type="number" name="max_upload_mb" min="1" max="{{ server_max_upload_mb }}" value="{{ max_upload_mb }}" required></label>
+        <button class="button" type="submit">Save limit</button>
+      </form>
+    </section>
+    {% else %}
+    <section class="card">
+      <div class="card-head"><div><h2>Automating uploads</h2><p class="lede">Use a key with the Python examples shipped in the repository.</p></div></div>
+      <pre class="snippet">curl -H "Authorization: Bearer $VAULT_KEY" \
+  -F "file=@report.pdf" \
+  https://your-host/api/v1/items</pre>
+    </section>
+    {% endif %}
+  </div>
 </div>
+
+<section class="card">
+  <div class="card-head"><div><h2>API keys</h2></div><span class="count-chip">{{ keys.len() }} active</span></div>
+  {% if keys.is_empty() %}
+  <div class="empty inline">
+    <span class="empty-art" aria-hidden="true"><svg class="i"><use href="#i-key"/></svg></span>
+    <h3>No keys yet</h3>
+    <p>Create one above to upload from a script without sharing your password.</p>
+  </div>
+  {% else %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead><tr><th>Name</th><th>Prefix</th><th>Permissions</th><th>Expires</th><th class="num">Action</th></tr></thead>
+      <tbody>
+        {% for key in keys %}
+        <tr>
+          <td><span class="cell-strong">{{ key.name }}</span></td>
+          <td><code class="mono">{{ key.start }}&hellip;</code></td>
+          <td><span class="pill-row">{% for permission in key.permissions %}<span class="pill">{{ permission }}</span>{% endfor %}</span></td>
+          <td class="mono subtle">{{ key.expires_at.as_deref().unwrap_or("Never") }}</td>
+          <td class="num"><form action="/keys/{{ key.id }}/revoke" method="post"><button class="link-btn danger" type="submit">Revoke</button></form></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
 {% if can_manage %}
-<section class="panel"><div class="panel-heading"><h2>Workspace settings</h2><span>Server maximum applies</span></div>
-  <form action="/workspaces/settings" method="post" class="inline-form"><label>Maximum upload (MB)<input type="number" name="max_upload_mb" min="1" max="{{ server_max_upload_mb }}" value="{{ max_upload_mb }}" required><span class="muted">Up to {{ server_max_upload_mb }} MiB</span></label><button class="button" type="submit">Save limit</button></form>
+<section class="card">
+  <div class="card-head"><div><h2>Members</h2></div><span class="count-chip">{{ members.len() }} people</span></div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead><tr><th>Person</th><th>Role</th><th>Joined</th><th class="num">Actions</th></tr></thead>
+      <tbody>
+        {% for member in members %}
+        <tr>
+          <td>
+            <span class="person">
+              <span class="avatar" aria-hidden="true">{{ member.name.chars().next().unwrap_or('?') }}</span>
+              <span><span class="cell-strong">{{ member.name }}</span><small>{{ member.email }}</small></span>
+            </span>
+          </td>
+          <td><span class="pill role-{{ member.role }}">{{ member.role }}</span></td>
+          <td class="mono subtle">{{ member.created_at }}</td>
+          <td class="num">
+            <div class="row-actions">
+              {% if member.role != "owner" %}
+              <form action="/workspaces/members/{{ member.id }}/role" method="post" class="inline-row">
+                <label class="sr-only" for="role-{{ member.id }}">Role for {{ member.name }}</label>
+                <select id="role-{{ member.id }}" name="role">
+                  <option value="member" {% if member.role == "member" %}selected{% endif %}>Member</option>
+                  <option value="admin" {% if member.role == "admin" %}selected{% endif %}>Admin</option>
+                </select>
+                <button class="link-btn" type="submit">Update</button>
+              </form>
+              {% if is_owner %}<form action="/workspaces/members/{{ member.id }}/transfer" method="post"><button class="link-btn" type="submit">Make owner</button></form>{% endif %}
+              <form action="/workspaces/members/{{ member.id }}/remove" method="post"><button class="link-btn danger" type="submit">Remove</button></form>
+              {% else %}<span class="subtle">&mdash;</span>{% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
-<section class="panel table-panel"><div class="panel-heading"><h2>Members</h2><span>{{ members.len() }} people</span></div><div class="table-wrap"><table><thead><tr><th>Person</th><th>Role</th><th>Joined</th><th>Actions</th></tr></thead><tbody>
-  {% for member in members %}<tr><td><strong>{{ member.name }}</strong><br><span class="muted">{{ member.email }}</span></td><td>{{ member.role }}</td><td>{{ member.created_at }}</td><td class="actions-cell">
-  {% if member.role != "owner" %}<form action="/workspaces/members/{{ member.id }}/role" method="post"><select name="role" aria-label="Role for {{ member.name }}"><option value="member" {% if member.role == "member" %}selected{% endif %}>Member</option><option value="admin" {% if member.role == "admin" %}selected{% endif %}>Admin</option></select><button class="link-button" type="submit">Update</button></form>
-  <form action="/workspaces/members/{{ member.id }}/remove" method="post"><button class="link-button danger" type="submit">Remove</button></form>{% endif %}
-  {% if is_owner && member.role != "owner" %}<form action="/workspaces/members/{{ member.id }}/transfer" method="post"><button class="link-button" type="submit">Make owner</button></form>{% endif %}
-  </td></tr>{% endfor %}
-  </tbody></table></div></section>
 {% endif %}
-<section class="panel table-panel"><div class="panel-heading"><h2>API keys</h2><span>{{ keys.len() }} keys</span></div>
-  <div class="table-wrap"><table><thead><tr><th>Name</th><th>Prefix</th><th>Permissions</th><th>Expires</th><th></th></tr></thead><tbody>
-  {% for key in keys %}<tr><td>{{ key.name }}</td><td><code>{{ key.start }}…</code></td><td>{{ key.permissions|join(", ") }}</td><td>{{ key.expires_at.as_deref().unwrap_or("Never") }}</td><td><form action="/keys/{{ key.id }}/revoke" method="post"><button class="link-button danger" type="submit">Revoke</button></form></td></tr>{% endfor %}
-  </tbody></table></div>
+
+{% if is_owner %}
+<section class="card danger-zone">
+  <div class="card-head"><div><h2>Delete this workspace</h2><p class="lede">Permanently removes the workspace, its metadata, and every stored file.</p></div></div>
+  <form action="/workspaces/delete" method="post" class="row-form">
+    <label class="field grow">Type <strong>{{ workspace_name }}</strong> to confirm<input name="confirmation" required autocomplete="off" placeholder="{{ workspace_name }}"></label>
+    <button class="button danger" type="submit"><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg>Delete permanently</button>
+  </form>
 </section>
-{% if is_owner %}<section class="panel danger-zone"><h2>Delete workspace</h2><p>This permanently removes the workspace metadata and stored files. Type <strong>{{ workspace_name }}</strong> to confirm.</p><form action="/workspaces/delete" method="post" class="inline-form"><label>Workspace name<input name="confirmation" required autocomplete="off"></label><button class="button danger" type="submit">Delete permanently</button></form></section>{% endif %}
+{% endif %}
 {% endblock %}

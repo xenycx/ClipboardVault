@@ -4,8 +4,10 @@ This directory contains Askama HTML templates rendered by `src/pages.rs`. It is 
 
 ## Template structure
 
-- `base.html` owns metadata, security-compatible asset loading, the shared header, theme control, main shell, and toast region.
-- `dashboard.html` owns capture, upload, filtering, item actions, and the file preview dialog.
+- `base.html` owns metadata, security-compatible asset loading, the SVG icon sprite, and the toast region. It renders one `layout` block and nothing else.
+- `app_base.html` extends `base.html` with the signed-in shell: sidebar, workspace switcher, primary navigation, storage meter, account footer, top bar, and command palette. Every page that extends it must supply `session` and `nav`.
+- `auth_base.html` extends `base.html` with the signed-out split layout and exposes `auth_title`, `auth_lede`, and `auth_card`.
+- `dashboard.html` owns capture, upload, search, type filters, the trash view, item actions, and the file preview dialog.
 - `login.html`, `setup.html`, `pending.html`, `join.html`, and `reset_password.html` cover the identity lifecycle.
 - `keys.html`, `storage.html`, and `admin.html` cover workspace access, cleanup, and global administration.
 - `one_time_secret.html` displays sensitive values exactly once.
@@ -13,6 +15,8 @@ This directory contains Askama HTML templates rendered by `src/pages.rs`. It is 
 ## Backend/template contract
 
 - Template structs and fields are declared in `src/pages.rs`. Any new interpolation must be supplied there with the correct type.
+- The vault view is driven by the `q`, `kind`, and `trash` query parameters. Filter links are built in Rust (`vault_href`) so escaping stays server side.
+- Icons are `<use href="#i-name">` references into the sprite in `base.html`. Add the symbol there rather than pasting inline paths.
 - Form `action`, method, input names, and enum values must match the Rust page handlers.
 - Conditional UI is not authorization. Rust must enforce the same permission regardless of whether a button or section is hidden.
 - Escape user content by default. Keep HTML previews sandboxed and source views inert.

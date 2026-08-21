@@ -8,7 +8,10 @@ pub mod pages;
 pub mod storage;
 pub mod uploads;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
+};
 
 use axum::{
     Router,
@@ -17,6 +20,7 @@ use axum::{
     middleware,
     routing::{get, post},
 };
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -55,6 +59,43 @@ impl AppState {
             tus_session_ttl_seconds: config.tus_session_ttl_seconds,
         }
     }
+}
+
+/// Fingerprint of everything under `static/`, appended to asset URLs as `?v=`.
+///
+/// A deploy replaces the stylesheet and the markup together. Without a new URL a
+/// browser can pair freshly rendered HTML with a cached copy of the old CSS, which
+/// renders the application unusable until a hard refresh.
+static ASSET_VERSION: LazyLock<String> = LazyLock::new(|| {
+    asset_fingerprint(Path::new("static")).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+});
+
+pub fn asset_version() -> &'static str {
+    &ASSET_VERSION
+}
+
+fn asset_fingerprint(root: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    collect_files(root, &mut files)?;
+    files.sort();
+    let mut hasher = Sha256::new();
+    for file in files {
+        hasher.update(file.to_string_lossy().as_bytes());
+        hasher.update(std::fs::read(&file).ok()?);
+    }
+    Some(hex::encode(hasher.finalize())[..12].to_string())
+}
+
+fn collect_files(directory: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+    for entry in std::fs::read_dir(directory).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Some(())
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -157,6 +198,7 @@ async fn security_headers(
         .remove("oai-authenticated-user-full-name");
     let preview = request.uri().path().ends_with("/preview");
     let tus = request.uri().path().starts_with("/api/v1/uploads");
+    let asset = request.uri().path().starts_with("/static/");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
@@ -183,5 +225,73 @@ async fn security_headers(
     if tus {
         headers.insert("tus-resumable", "1.0.0".parse().unwrap());
     }
+    if asset {
+        // Every asset URL carries a content fingerprint, so the bytes behind a
+        // given URL never change and may be cached indefinitely.
+        headers.insert(
+            "cache-control",
+            "public, max-age=31536000, immutable".parse().unwrap(),
+        );
+    } else if headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"))
+    {
+        // Rendered pages contain workspace data. Keep them out of shared and
+        // on-disk caches, including after sign-out on a shared machine.
+        headers.insert("cache-control", "no-store".parse().unwrap());
+    }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_fingerprint;
+    use std::path::Path;
+
+    #[test]
+    fn fingerprint_is_stable_for_unchanged_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("app.css"), "body{}").unwrap();
+        let first = asset_fingerprint(directory.path()).unwrap();
+        let second = asset_fingerprint(directory.path()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 12);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_an_asset_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("app.css");
+        std::fs::write(&file, "body{color:red}").unwrap();
+        let before = asset_fingerprint(directory.path()).unwrap();
+        std::fs::write(&file, "body{color:blue}").unwrap();
+        assert_ne!(before, asset_fingerprint(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_covers_nested_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let vendor = directory.path().join("vendor");
+        std::fs::create_dir(&vendor).unwrap();
+        std::fs::write(vendor.join("lib.js"), "one").unwrap();
+        let before = asset_fingerprint(directory.path()).unwrap();
+        std::fs::write(vendor.join("lib.js"), "two").unwrap();
+        assert_ne!(before, asset_fingerprint(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn the_shipped_assets_produce_a_real_fingerprint() {
+        // Guards the production path: the server hashes ./static relative to its
+        // working directory, which is /app in the container image.
+        let version = asset_fingerprint(Path::new("static")).expect("static/ must be readable");
+        assert_eq!(version.len(), 12);
+        assert!(version.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(super::asset_version(), version);
+    }
+
+    #[test]
+    fn a_missing_directory_falls_back_instead_of_failing() {
+        assert!(asset_fingerprint(Path::new("does-not-exist")).is_none());
+    }
 }

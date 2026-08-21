@@ -1,13 +1,16 @@
-{% extends "base.html" %}
-{% block title %}First administrator setup · Clipboard Vault{% endblock %}
-{% block content %}
-<section class="center-card panel">
-  <span class="eyebrow">ONE-TIME SETUP</span><h1>Claim the first administrator</h1>
-  <p>Sign in or register first, then paste the private setup token from the VPS <code>.env</code> file. This page closes after the first administrator is created.</p>
+{% extends "auth_base.html" %}
+{% block title %}First administrator setup &middot; Clipboard Vault{% endblock %}
+{% block auth_title %}Claim the first administrator.{% endblock %}
+{% block auth_lede %}This page closes forever once one administrator exists on this server.{% endblock %}
+{% block auth_card %}
+<div class="card auth-card">
+  <span class="status pending"><svg class="i" aria-hidden="true"><use href="#i-spark"/></svg>One-time setup</span>
+  <h2>Setup token</h2>
+  <p class="pane-lede">Sign in or register first, then paste the private setup token from the server <code>.env</code> file.</p>
   <form data-bootstrap class="stack">
-    <label>Setup token<input type="password" name="token" autocomplete="off" required></label>
-    <button class="button primary" type="submit">Make my account administrator</button>
+    <label class="field">Setup token<input type="password" name="token" autocomplete="off" placeholder="Paste BOOTSTRAP_TOKEN" required></label>
+    <button class="button primary block" type="submit">Make my account administrator</button>
   </form>
   <p class="form-error" data-auth-error role="alert"></p>
-</section>
+</div>
 {% endblock %}

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block body_class %}auth{% endblock %}
+{% block layout %}
+<div class="auth-frame">
+  <section class="auth-aside">
+    <a class="brand" href="/">
+      <span class="brand-mark"><svg class="i" aria-hidden="true"><use href="#i-logo"/></svg></span>
+      <span class="brand-name">Clipboard <b>Vault</b></span>
+    </a>
+    <div class="auth-pitch">
+      <h1>{% block auth_title %}Everything worth keeping, in one private place.{% endblock %}</h1>
+      <p>{% block auth_lede %}Paste text, code, and links. Stream files up to gigabytes. Reach it all from the browser or your own scripts.{% endblock %}</p>
+      <ul class="auth-points">
+        <li><svg class="i" aria-hidden="true"><use href="#i-vault"/></svg><div><strong>Self-hosted by you</strong><span>Your server, your disk, your rules.</span></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-upload"/></svg><div><strong>Resumable uploads</strong><span>Pause, resume, and retry big transfers.</span></div></li>
+        <li><svg class="i" aria-hidden="true"><use href="#i-key"/></svg><div><strong>Scoped API keys</strong><span>Automate from scripts without sharing a password.</span></div></li>
+      </ul>
+    </div>
+    <p class="auth-foot">Clipboard Vault never reads your clipboard. Copying is always an explicit click.</p>
+  </section>
+  <section class="auth-main">
+    <div class="auth-top">
+      <button class="icon-btn theme-btn" type="button" data-theme-toggle aria-label="Switch theme" title="Switch theme">
+        <svg class="i icon-dark" aria-hidden="true"><use href="#i-moon"/></svg>
+        <svg class="i icon-light" aria-hidden="true"><use href="#i-sun"/></svg>
+      </button>
+    </div>
+    <main class="auth-card-wrap" id="main">
+      {% block auth_card %}{% endblock %}
+    </main>
+  </section>
+</div>
+{% endblock %}

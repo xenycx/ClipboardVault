@@ -242,6 +242,40 @@ async fn create_file_item(
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
 
+/// Turns free text into a prefix `tsquery`: `depl loc` becomes `depl:* & loc:*`.
+///
+/// Prefix matching is what makes typing part of a word feel like search, and it
+/// still rides the `vault_items_search_idx` GIN index. `ILIKE '%term%'` would not.
+/// Returns `None` when nothing searchable is left, so callers can skip the clause.
+pub(crate) fn search_tsquery(input: &str) -> Option<String> {
+    let lexemes: Vec<String> = input
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(8)
+        .map(|word| {
+            let mut lexeme: String = word.chars().take(48).collect::<String>().to_lowercase();
+            lexeme.push_str(":*");
+            lexeme
+        })
+        .collect();
+    if lexemes.is_empty() {
+        None
+    } else {
+        Some(lexemes.join(" & "))
+    }
+}
+
+/// Adds the shared full-text condition so the page and the API agree on results.
+pub(crate) fn push_search(builder: &mut QueryBuilder<'_, Postgres>, input: &str) {
+    let Some(tsquery) = search_tsquery(input) else {
+        return;
+    };
+    builder
+        .push(" AND to_tsvector('simple', coalesce(text_payload,'') || ' ' || coalesce(original_filename,'') || ' ' || virtual_path) @@ to_tsquery('simple', ")
+        .push_bind(tsquery)
+        .push(")");
+}
+
 pub async fn list_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -266,11 +300,8 @@ pub async fn list_items(
     if let Some(tag) = query.tag {
         builder.push(" AND tags ? ").push_bind(tag);
     }
-    if let Some(q) = query.q.filter(|q| !q.trim().is_empty()) {
-        builder
-            .push(" AND to_tsvector('simple', coalesce(text_payload,'') || ' ' || coalesce(original_filename,'') || ' ' || virtual_path) @@ plainto_tsquery('simple', ")
-            .push_bind(q)
-            .push(")");
+    if let Some(q) = query.q.as_deref() {
+        push_search(&mut builder, q);
     }
     builder
         .push(" ORDER BY pinned DESC, created_at DESC LIMIT ")
@@ -860,6 +891,7 @@ pub struct StorageCleanupItem {
 pub struct StorageStatusResponse {
     pub workspace_name: String,
     pub free_bytes: u64,
+    pub total_bytes: u64,
     pub reserve_bytes: u64,
     pub workspace_bytes: i64,
     pub reserved_upload_bytes: i64,
@@ -921,6 +953,7 @@ pub(crate) async fn storage_details(
         .map(|item| item.reclaimable_bytes)
         .sum();
     let free_bytes = crate::uploads::available_space(&state.upload_root)?;
+    let total_bytes = crate::uploads::total_space(&state.upload_root)?;
     let low_storage = free_bytes
         < state
             .upload_disk_reserve_bytes
@@ -928,6 +961,7 @@ pub(crate) async fn storage_details(
     Ok(StorageStatusResponse {
         workspace_name,
         free_bytes,
+        total_bytes,
         reserve_bytes: state.upload_disk_reserve_bytes,
         workspace_bytes,
         reserved_upload_bytes,
@@ -1196,5 +1230,61 @@ async fn audit(
     ).bind(&auth.organization_id).bind(&auth.user_id).bind(&auth.api_key_id).bind(action).bind(item_id).bind(detail).execute(&state.pool).await;
     if let Err(error) = result {
         tracing::warn!(%error, "failed to record activity");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_tsquery;
+
+    #[test]
+    fn a_single_word_becomes_a_prefix_lexeme() {
+        assert_eq!(search_tsquery("deploy").as_deref(), Some("deploy:*"));
+    }
+
+    #[test]
+    fn every_word_must_match() {
+        assert_eq!(
+            search_tsquery("deploy logs").as_deref(),
+            Some("deploy:* & logs:*")
+        );
+    }
+
+    #[test]
+    fn punctuation_splits_instead_of_reaching_tsquery_syntax() {
+        // A raw ':' or '&' would make to_tsquery reject the whole statement.
+        assert_eq!(
+            search_tsquery("user@example.com").as_deref(),
+            Some("user:* & example:* & com:*")
+        );
+        assert_eq!(
+            search_tsquery("a & b | c:*").as_deref(),
+            Some("a:* & b:* & c:*")
+        );
+    }
+
+    #[test]
+    fn searching_is_case_insensitive() {
+        assert_eq!(search_tsquery("Deploy").as_deref(), Some("deploy:*"));
+    }
+
+    #[test]
+    fn blank_and_symbol_only_input_produces_no_clause() {
+        assert!(search_tsquery("").is_none());
+        assert!(search_tsquery("   ").is_none());
+        assert!(search_tsquery("!!! ???").is_none());
+    }
+
+    #[test]
+    fn long_input_is_bounded() {
+        let many = search_tsquery("a b c d e f g h i j k l").unwrap();
+        assert_eq!(many.matches(" & ").count(), 7);
+        let long = search_tsquery(&"z".repeat(200)).unwrap();
+        assert_eq!(long.len(), 50);
+    }
+
+    #[test]
+    fn non_ascii_words_survive() {
+        assert_eq!(search_tsquery("ანგარიში").as_deref(), Some("ანგარიში:*"));
     }
 }

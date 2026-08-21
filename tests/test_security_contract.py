@@ -204,3 +204,66 @@ def test_upgrade_path_retains_backup_and_rollback_images() -> None:
     assert "compose build --pull auth vault" in upgrade
     assert "--no-build --wait --wait-timeout 120 auth vault" in upgrade
     assert "restore_images" in upgrade
+
+
+def test_templates_contain_no_inline_scripts_or_handlers() -> None:
+    """The page CSP is script-src 'self' with no nonce, so inline JavaScript is dead code."""
+    for template in (ROOT / "templates").glob("*.html"):
+        markup = template.read_text(encoding="utf-8")
+        assert "<script>" not in markup, f"{template.name} has an inline script block"
+        for handler in ("onclick=", "onchange=", "onsubmit=", "onload=", "oninput=", "onerror="):
+            assert handler not in markup, f"{template.name} has an inline {handler} handler"
+
+
+def test_templates_reference_static_assets_through_the_version_filter() -> None:
+    """Unversioned asset URLs let a browser pair new HTML with a cached old stylesheet."""
+    pattern = re.compile(r'(?:src|href)="(/static/[^"?]+)"')
+    for template in (ROOT / "templates").glob("*.html"):
+        stale = pattern.findall(template.read_text(encoding="utf-8"))
+        assert not stale, f"{template.name} references {stale} without the |asset filter"
+
+
+def test_static_responses_are_cached_and_pages_are_not() -> None:
+    source = (ROOT / "src" / "lib.rs").read_text(encoding="utf-8")
+    assert "public, max-age=31536000, immutable" in source
+    assert '"cache-control", "no-store"' in source
+
+
+def test_search_uses_the_indexed_expression() -> None:
+    """The GIN index only helps if the query repeats its expression verbatim."""
+    api = (ROOT / "src" / "api.rs").read_text(encoding="utf-8")
+    migration = (ROOT / "migrations" / "0001_vault.sql").read_text(encoding="utf-8")
+    expression = "coalesce(text_payload"
+    assert expression in api and expression in migration
+    code = "\n".join(
+        line for line in api.splitlines() if not line.lstrip().startswith("//")
+    )
+    assert "ILIKE" not in code, "ILIKE '%term%' cannot use vault_items_search_idx"
+
+
+def test_every_referenced_asset_exists_on_disk() -> None:
+    """A typo in an asset path is a 404 that only shows up in a browser."""
+    pattern = re.compile(r'"(/static/[^"?]+)"')
+    for template in (ROOT / "templates").glob("*.html"):
+        for reference in pattern.findall(template.read_text(encoding="utf-8")):
+            asset = ROOT / reference.lstrip("/")
+            assert asset.is_file(), f"{template.name} references missing {reference}"
+
+
+def test_runtime_image_ships_the_rendered_frontend() -> None:
+    """The Rust binary renders templates and serves static/ from its working directory."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    runtime = dockerfile.split("AS runtime", 1)[1]
+    for directory in ("templates", "static", "migrations"):
+        assert f"COPY {directory} ./{directory}" in runtime, f"runtime image is missing {directory}"
+
+
+def test_icon_symbols_used_by_templates_are_defined() -> None:
+    """Icons are <use> references into the sprite in base.html; a missing symbol renders blank."""
+    base = (ROOT / "templates" / "base.html").read_text(encoding="utf-8")
+    defined = set(re.findall(r'<symbol id="([^"]+)"', base))
+    assert defined, "the icon sprite is missing from base.html"
+    for template in (ROOT / "templates").glob("*.html"):
+        markup = template.read_text(encoding="utf-8")
+        for used in re.findall(r'<use href="#(i-[a-z-]+)"', markup):
+            assert used in defined, f"{template.name} uses undefined icon #{used}"

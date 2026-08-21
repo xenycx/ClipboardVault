@@ -74,6 +74,66 @@ pub struct ItemRow {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+impl ItemRow {
+    /// Tag strings stored in the `tags` JSON column, ready for template iteration.
+    pub fn tag_list(&self) -> Vec<String> {
+        self.tags
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Short human title: the original filename, else the first meaningful line of text.
+    pub fn display_name(&self) -> String {
+        if let Some(name) = self
+            .original_filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+        if let Some(line) = self
+            .text_payload
+            .as_deref()
+            .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        {
+            let title: String = line.chars().take(72).collect();
+            return if line.chars().count() > 72 {
+                format!("{title}\u{2026}")
+            } else {
+                title
+            };
+        }
+        format!("Untitled {}", self.kind)
+    }
+
+    /// Compact relative age such as `4m ago`, `6h ago`, or `12 Mar 2026`.
+    pub fn age(&self) -> String {
+        let elapsed = Utc::now().signed_duration_since(self.created_at);
+        let minutes = elapsed.num_minutes();
+        if minutes < 1 {
+            "just now".to_string()
+        } else if minutes < 60 {
+            format!("{minutes}m ago")
+        } else if elapsed.num_hours() < 24 {
+            format!("{}h ago", elapsed.num_hours())
+        } else if elapsed.num_days() < 7 {
+            format!("{}d ago", elapsed.num_days())
+        } else {
+            self.created_at.format("%d %b %Y").to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct BlobRow {
     pub id: Uuid,
