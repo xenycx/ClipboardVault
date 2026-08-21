@@ -5,10 +5,11 @@
 <section class="page-heading"><span class="eyebrow">{{ workspace_name }}</span><h1>Storage</h1><p>Review capacity and permanently remove only the files you select. Clipboard Vault never deletes files automatically.</p></section>
 {% if low_storage %}<aside class="storage-warning" role="alert"><div><strong>Uploads are limited by low disk space.</strong><span>Free space must stay above the protected reserve.</span></div></aside>{% endif %}
 <section class="storage-metrics" aria-label="Storage summary">
-  <div class="storage-metric"><span class="muted">Workspace files</span><strong>{{ workspace_bytes }} bytes</strong></div>
-  <div class="storage-metric"><span class="muted">Server free</span><strong>{{ free_bytes }} bytes</strong></div>
-  <div class="storage-metric"><span class="muted">Protected reserve</span><strong>{{ reserve_bytes }} bytes</strong></div>
-  <div class="storage-metric"><span class="muted">Reclaimable</span><strong>{{ reclaimable_bytes }} bytes</strong></div>
+  <div class="storage-metric primary"><span class="muted">Workspace files</span><strong>{{ workspace_bytes|format_bytes }}</strong></div>
+  <div class="storage-metric"><span class="muted">Server free</span><strong>{{ free_bytes|format_bytes }}</strong></div>
+  <div class="storage-metric"><span class="muted">Protected reserve</span><strong>{{ reserve_bytes|format_bytes }}</strong></div>
+  <div class="storage-metric"><span class="muted">Reserved for uploads</span><strong>{{ reserved_upload_bytes|format_bytes }}</strong></div>
+  <div class="storage-metric"><span class="muted">In Trash, reclaimable by purging</span><strong>{{ reclaimable_bytes|format_bytes }}</strong></div>
 </section>
 <form action="/storage/purge" method="post" class="panel stack" data-storage-purge>
   <div class="panel-heading"><div><h2>Choose files to purge</h2><p class="muted">Trashed files are listed first, followed by the oldest and largest files.</p></div><span>{{ cleanup_items.len() }} files</span></div>
@@ -17,7 +18,7 @@
       <td><input type="checkbox" name="item_ids" value="{{ item.id }}" aria-label="Select {{ item.filename }}"></td>
       <td><strong>{{ item.filename }}</strong></td>
       <td>{% if item.deleted %}<span class="status rejected">Trash</span>{% else %}<span class="status approved">Active</span>{% endif %}</td>
-      <td>{{ item.size_bytes }} bytes</td><td>{{ item.reclaimable_bytes }} bytes</td><td>{{ item.created_at }}</td>
+      <td>{{ item.size_bytes|format_bytes }}</td><td>{{ item.reclaimable_bytes|format_bytes }}</td><td>{{ item.created_at }}</td>
     </tr>{% endfor %}
   </tbody></table></div>
   {% if cleanup_items.is_empty() %}<p class="muted">There are no files available for cleanup.</p>{% endif %}

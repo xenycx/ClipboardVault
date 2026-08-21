@@ -18,6 +18,7 @@ use crate::{
     AppState, api,
     auth::workspace_cookie,
     error::{AppError, AppResult},
+    filters,
     models::{AuthContext, BridgeSession, ItemCreate, ItemRow},
 };
 
@@ -122,6 +123,7 @@ pub struct StorageTemplate {
     pub free_bytes: u64,
     pub reserve_bytes: u64,
     pub workspace_bytes: i64,
+    pub reserved_upload_bytes: i64,
     pub reclaimable_bytes: i64,
     pub low_storage: bool,
     pub cleanup_items: Vec<api::StorageCleanupItem>,
@@ -303,6 +305,7 @@ pub async fn storage_page(
         free_bytes: details.free_bytes,
         reserve_bytes: details.reserve_bytes,
         workspace_bytes: details.workspace_bytes,
+        reserved_upload_bytes: details.reserved_upload_bytes,
         reclaimable_bytes: details.reclaimable_bytes,
         low_storage: details.low_storage,
         cleanup_items: details.items,

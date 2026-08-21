@@ -58,7 +58,7 @@
     <article class="item-card" data-item-card data-search="{{ item.kind }} {{ item.virtual_path }} {{ item.original_filename.as_deref().unwrap_or("") }}">
       <div class="type-pill {{ item.kind }}">{{ item.kind }}</div>
       <div class="item-body">
-        <div class="item-meta"><span>{{ item.virtual_path }}</span><span>{{ item.size_bytes }} bytes</span><time>{{ item.created_at.format("%Y-%m-%d %H:%M") }}</time></div>
+        <div class="item-meta"><span>{{ item.virtual_path }}</span><span>{{ item.size_bytes|format_bytes }}</span><time>{{ item.created_at.format("%Y-%m-%d %H:%M") }}</time></div>
         {% match item.text_payload %}{% when Some with (payload) %}{% if item.kind == "html" %}<iframe class="html-preview" sandbox="" referrerpolicy="no-referrer" srcdoc="{{ payload }}" title="Sandboxed HTML preview"></iframe><details><summary>View escaped source</summary><pre>{{ payload }}</pre></details>{% else %}<pre>{{ payload }}</pre>{% endif %}{% when None %}<a class="file-link" href="/api/v1/items/{{ item.id }}/content">{{ item.original_filename.as_deref().unwrap_or("Download file") }}</a>{% endmatch %}
       </div>
       <div class="item-actions">

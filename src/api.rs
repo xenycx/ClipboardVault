@@ -920,7 +920,7 @@ pub(crate) async fn storage_details(
     let low_storage = free_bytes
         < state
             .upload_disk_reserve_bytes
-            .saturating_add(state.server_max_upload_bytes);
+            .saturating_add(reserved_upload_bytes.max(0) as u64);
     Ok(StorageStatusResponse {
         workspace_name,
         free_bytes,
