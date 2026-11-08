@@ -1,0 +1,31 @@
+{% extends "auth_base.html" %}
+{% block title %}API key created &middot; Clipboard Vault{% endblock %}
+{% block auth_title %}Your key is ready. Copy it now.{% endblock %}
+{% block auth_lede %}Only a hash is stored, so this is the one time the full key is shown.{% endblock %}
+{% block auth_card %}
+<div class="card auth-card wide" data-key-created data-server="{{ server_url }}" data-script-src="{{ "/static/vault.py"|asset }}">
+  <div class="card-row">
+    <h2>{{ name }}</h2>
+    <span class="badges"><span class="badge">write</span>{% if can_read %}<span class="badge">read</span>{% endif %}{% if can_delete %}<span class="badge">delete</span>{% endif %}</span>
+  </div>
+  <div class="secret-box">
+    <code data-secret>{{ secret }}</code>
+    <button class="button" type="button" data-copy-value="{{ secret }}"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy</span></button>
+  </div>
+
+  <div class="script-box">
+    <div class="card-row">
+      <h3>Python client with this key</h3>
+      <button class="button primary" type="button" data-download-script><svg class="i" aria-hidden="true"><use href="#i-download"/></svg><span>Download vault.py</span></button>
+    </div>
+    <p class="pane-lede">One file, standard library only. The server address and this key are already inside, so anyone holding the file can use the key. Keep it private.</p>
+    <pre class="snippet"><code>python vault.py up ./screenshot.png
+python vault.py ls
+python vault.py get &lt;id&gt; -o ~/Downloads{% if !can_read %}
+
+# This key cannot read. Create one with "Read items" to list or download.{% endif %}</code></pre>
+  </div>
+
+  <a class="button block" href="/keys">Done</a>
+</div>
+{% endblock %}

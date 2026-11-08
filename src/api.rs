@@ -463,10 +463,16 @@ pub async fn download_content(
     Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<Response> {
     let auth = authorize(&state.auth, &headers, "items:read").await?;
+    // Trashed items stay readable so people can check them before purging; the
+    // trash listing is already available to the same `items:read` permission.
+    let item = fetch_item(&state, &auth.organization_id, id).await?;
+    if let Some(payload) = item.text_payload.as_deref() {
+        return Ok(text_download(&item, payload, &method));
+    }
     let row = sqlx::query_as::<_, (String, String, Option<String>)>(
         r#"SELECT b.storage_key, b.mime_type, i.original_filename
            FROM vault_items i JOIN vault_blobs b ON b.id = i.blob_id
-           WHERE i.id = $1 AND i.organization_id = $2 AND i.deleted_at IS NULL"#,
+           WHERE i.id = $1 AND i.organization_id = $2"#,
     )
     .bind(id)
     .bind(&auth.organization_id)
@@ -498,7 +504,7 @@ pub async fn preview_content(
     let row = sqlx::query_as::<_, (String, String, Option<String>, i64)>(
         r#"SELECT b.storage_key, b.mime_type, i.original_filename, b.size_bytes
            FROM vault_items i JOIN vault_blobs b ON b.id = i.blob_id
-           WHERE i.id=$1 AND i.organization_id=$2 AND i.deleted_at IS NULL"#,
+           WHERE i.id=$1 AND i.organization_id=$2"#,
     )
     .bind(id)
     .bind(&auth.organization_id)
@@ -530,6 +536,27 @@ pub async fn preview_content(
             if row.3 > 50 * 1024 * 1024 {
                 return Err(AppError::PreviewUnavailable);
             }
+            let mut response =
+                ranged_file_response(&path, &headers, &method, preview.mime, "inline", &filename)
+                    .await?;
+            if preview.mime == "image/svg+xml" {
+                // An SVG opened directly is a document. Sandbox it so embedded
+                // script or links can never act inside this origin.
+                response.headers_mut().insert(
+                    header::CONTENT_SECURITY_POLICY,
+                    HeaderValue::from_static(
+                        "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox",
+                    ),
+                );
+            }
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=300"),
+            );
+            set_preview_headers(&mut response, &preview, false);
+            Ok(response)
+        }
+        "video" | "audio" => {
             let mut response =
                 ranged_file_response(&path, &headers, &method, preview.mime, "inline", &filename)
                     .await?;
@@ -567,6 +594,69 @@ pub async fn preview_content(
         }
         _ => Err(AppError::PreviewUnavailable),
     }
+}
+
+/// Text items download as a plain-text attachment named after their first line.
+/// They are never served as HTML, so a pasted page cannot run in this origin.
+fn text_download(item: &ItemRow, payload: &str, method: &Method) -> Response {
+    let stem: String = item
+        .display_name()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+    let stem = if stem.is_empty() {
+        "clipboard".to_string()
+    } else {
+        stem
+    };
+    let extension = match item.kind.as_str() {
+        "html" => "html.txt",
+        "url" => "url.txt",
+        _ => "txt",
+    };
+    let filename = format!("{stem}.{extension}");
+    let mut response = if *method == Method::HEAD {
+        Response::new(Body::empty())
+    } else {
+        Response::new(Body::from(payload.to_owned()))
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&payload.len().to_string()).unwrap(),
+    );
+    let ascii: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() && c != '"' { c } else { '_' })
+        .collect();
+    let encoded: String = url::form_urlencoded::byte_serialize(filename.as_bytes()).collect();
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"{ascii}\"; filename*=UTF-8''{}",
+            encoded.replace('+', "%20")
+        ))
+        .unwrap_or(HeaderValue::from_static("attachment")),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 async fn ranged_file_response(
@@ -713,6 +803,22 @@ fn classify_preview(sample: &[u8], mime: &str, filename: &str) -> PreviewClassif
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    if let Some((kind, mime)) = media_signature(sample, &extension) {
+        return PreviewClassification {
+            kind,
+            mime,
+            language: "",
+        };
+    }
+    let looks_like_svg = (extension == "svg" || mime == "image/svg+xml")
+        && std::str::from_utf8(sample).is_ok_and(|text| text.contains("<svg"));
+    if looks_like_svg {
+        return PreviewClassification {
+            kind: "image",
+            mime: "image/svg+xml",
+            language: "",
+        };
+    }
     let textual_mime = mime.starts_with("text/")
         || matches!(
             mime,
@@ -760,6 +866,45 @@ fn classify_preview(sample: &[u8], mime: &str, filename: &str) -> PreviewClassif
                 | "csv"
                 | "tsv"
                 | "svg"
+                | "kt"
+                | "kts"
+                | "swift"
+                | "lua"
+                | "dart"
+                | "vue"
+                | "svelte"
+                | "scss"
+                | "sass"
+                | "less"
+                | "env"
+                | "properties"
+                | "gradle"
+                | "r"
+                | "pl"
+                | "ex"
+                | "exs"
+                | "zig"
+                | "hs"
+                | "scala"
+                | "tf"
+                | "proto"
+                | "graphql"
+                | "gql"
+                | "jsonl"
+                | "ndjson"
+                | "rst"
+                | "tex"
+                | "diff"
+                | "patch"
+                | "bat"
+                | "cmd"
+                | "fish"
+                | "zsh"
+                | "nix"
+                | "mjs"
+                | "cjs"
+                | "mts"
+                | "cts"
         );
     let binary = sample.iter().take(8192).filter(|byte| **byte == 0).count()
         > sample.len().saturating_div(16).max(1)
@@ -796,10 +941,76 @@ fn classify_preview(sample: &[u8], mime: &str, filename: &str) -> PreviewClassif
     }
 }
 
+/// Audio and video containers browsers can play natively, recognised by their bytes.
+/// The filename only disambiguates containers that hold either (Ogg, MP4).
+fn media_signature(sample: &[u8], extension: &str) -> Option<(&'static str, &'static str)> {
+    if sample.len() >= 12 && &sample[4..8] == b"ftyp" {
+        let brand = &sample[8..12];
+        if matches!(
+            brand,
+            b"avif" | b"avis" | b"heic" | b"heix" | b"mif1" | b"msf1"
+        ) {
+            return None;
+        }
+        if brand == b"M4A " || brand == b"M4B " || matches!(extension, "m4a" | "aac") {
+            return Some(("audio", "audio/mp4"));
+        }
+        if brand == b"qt  " {
+            return Some(("video", "video/quicktime"));
+        }
+        return Some(("video", "video/mp4"));
+    }
+    if sample.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some(if matches!(extension, "weba") {
+            ("audio", "audio/webm")
+        } else {
+            ("video", "video/webm")
+        });
+    }
+    if sample.starts_with(b"OggS") {
+        return Some(if extension == "ogv" {
+            ("video", "video/ogg")
+        } else {
+            ("audio", "audio/ogg")
+        });
+    }
+    if sample.starts_with(b"fLaC") {
+        return Some(("audio", "audio/flac"));
+    }
+    if sample.len() >= 12 && &sample[..4] == b"RIFF" && &sample[8..12] == b"WAVE" {
+        return Some(("audio", "audio/wav"));
+    }
+    if sample.starts_with(b"ID3")
+        || (sample.len() >= 2 && sample[0] == 0xff && matches!(sample[1], 0xfb | 0xf3 | 0xf2))
+    {
+        return Some(("audio", "audio/mpeg"));
+    }
+    None
+}
+
 fn language_for_extension(ext: &str) -> &'static str {
     match ext {
-        "js" | "jsx" => "javascript",
-        "ts" | "tsx" => "typescript",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" | "mts" | "cts" => "typescript",
+        "kt" | "kts" => "kotlin",
+        "swift" => "swift",
+        "lua" => "lua",
+        "dart" => "dart",
+        "scss" | "sass" => "scss",
+        "less" => "less",
+        "php" => "php",
+        "r" => "r",
+        "pl" => "perl",
+        "scala" => "scala",
+        "graphql" | "gql" => "graphql",
+        "diff" | "patch" => "diff",
+        "ini" | "cfg" | "conf" | "env" | "properties" => "ini",
+        "bat" | "cmd" => "dos",
+        "zsh" | "fish" => "bash",
+        "jsonl" | "ndjson" => "json",
+        "vue" | "svelte" => "xml",
+        "tex" => "latex",
+        "proto" => "protobuf",
         "rs" => "rust",
         "py" => "python",
         "rb" => "ruby",
@@ -1023,9 +1234,8 @@ pub(crate) async fn purge_items(
         .into_iter()
         .collect::<Vec<_>>();
     let mut tx = state.pool.begin().await?;
-    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>)>(
-        r#"SELECT i.id, i.blob_id, b.storage_key
-           FROM vault_items i LEFT JOIN vault_blobs b ON b.id=i.blob_id
+    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        r#"SELECT i.id, i.blob_id FROM vault_items i
            WHERE i.organization_id=$1 AND i.id = ANY($2)
            FOR UPDATE OF i"#,
     )
@@ -1038,47 +1248,10 @@ pub(crate) async fn purge_items(
             "one or more selected items were not found".into(),
         ));
     }
-    sqlx::query("DELETE FROM vault_items WHERE organization_id=$1 AND id=ANY($2)")
-        .bind(&auth.organization_id)
-        .bind(&unique)
-        .execute(&mut *tx)
-        .await?;
-    let mut seen_blobs = HashSet::new();
-    let mut storage_keys = Vec::new();
-    let mut reclaimed_bytes = 0_i64;
-    for (_, blob_id, storage_key) in rows {
-        let Some(blob_id) = blob_id else { continue };
-        if !seen_blobs.insert(blob_id) {
-            continue;
-        }
-        let references = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*)::bigint FROM vault_items WHERE blob_id=$1",
-        )
-        .bind(blob_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if references == 0 {
-            let size = sqlx::query_scalar::<_, i64>(
-                "DELETE FROM vault_blobs WHERE id=$1 RETURNING size_bytes",
-            )
-            .bind(blob_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            reclaimed_bytes = reclaimed_bytes.saturating_add(size);
-            if let Some(key) = storage_key {
-                storage_keys.push(key);
-            }
-        }
-    }
+    let (storage_keys, reclaimed_bytes) =
+        delete_items_and_orphans(&mut tx, &auth.organization_id, &rows).await?;
     tx.commit().await?;
-    for key in storage_keys {
-        if let Ok(path) = checked_blob_path(state, &key)
-            && let Err(error) = tokio::fs::remove_file(path).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, storage_key=%key, "failed to remove purged blob");
-        }
-    }
+    remove_storage_keys(state, storage_keys).await;
     audit(
         state,
         auth,
@@ -1088,6 +1261,178 @@ pub(crate) async fn purge_items(
     )
     .await;
     Ok((unique.len(), reclaimed_bytes))
+}
+
+/// Deletes the given item rows and any blob that no longer has a reference.
+///
+/// Returns the storage keys of removed blobs (to unlink after commit) and the
+/// number of bytes reclaimed. Runs inside the caller's transaction.
+async fn delete_items_and_orphans(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    organization_id: &str,
+    rows: &[(Uuid, Option<Uuid>)],
+) -> AppResult<(Vec<String>, i64)> {
+    if rows.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let item_ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
+    let blob_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|(_, blob)| *blob)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    sqlx::query("DELETE FROM vault_items WHERE organization_id=$1 AND id=ANY($2)")
+        .bind(organization_id)
+        .bind(&item_ids)
+        .execute(&mut **tx)
+        .await?;
+    if blob_ids.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let removed = sqlx::query_as::<_, (String, i64)>(
+        r#"DELETE FROM vault_blobs b
+           WHERE b.id = ANY($1) AND b.organization_id = $2
+             AND NOT EXISTS (SELECT 1 FROM vault_items i WHERE i.blob_id = b.id)
+           RETURNING b.storage_key, b.size_bytes"#,
+    )
+    .bind(&blob_ids)
+    .bind(organization_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let reclaimed = removed
+        .iter()
+        .fold(0_i64, |total, (_, size)| total.saturating_add(*size));
+    Ok((removed.into_iter().map(|(key, _)| key).collect(), reclaimed))
+}
+
+/// Unlinks blob files after their metadata has been committed as deleted.
+pub(crate) async fn remove_storage_keys(state: &AppState, keys: Vec<String>) {
+    for key in keys {
+        if let Ok(path) = checked_blob_path(state, &key)
+            && let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, storage_key=%key, "failed to remove purged blob");
+        }
+    }
+}
+
+/// Permanently deletes trashed items: all of them, or only the listed ones.
+async fn purge_trashed(
+    state: &AppState,
+    auth: &crate::models::AuthContext,
+    ids: Option<Vec<Uuid>>,
+) -> AppResult<(usize, i64)> {
+    let mut tx = state.pool.begin().await?;
+    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        r#"SELECT i.id, i.blob_id FROM vault_items i
+           WHERE i.organization_id = $1 AND i.deleted_at IS NOT NULL
+             AND ($2::uuid[] IS NULL OR i.id = ANY($2))
+           FOR UPDATE OF i"#,
+    )
+    .bind(&auth.organization_id)
+    .bind(ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let (keys, reclaimed) = delete_items_and_orphans(&mut tx, &auth.organization_id, &rows).await?;
+    tx.commit().await?;
+    remove_storage_keys(state, keys).await;
+    Ok((rows.len(), reclaimed))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkItemsRequest {
+    action: String,
+    ids: Vec<Uuid>,
+}
+
+/// `POST /api/v1/items/bulk` — move several items to trash, restore them, or purge
+/// trashed ones. Requires `items:delete`, like the single-item routes.
+pub async fn bulk_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BulkItemsRequest>,
+) -> AppResult<Json<Value>> {
+    let auth = authorize(&state.auth, &headers, "items:delete").await?;
+    if auth.api_key_id.is_none() {
+        require_same_origin(&state, &headers)?;
+    }
+    let ids: Vec<Uuid> = input
+        .ids
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if ids.is_empty() || ids.len() > 1000 {
+        return Err(AppError::Validation(
+            "select between 1 and 1000 items".into(),
+        ));
+    }
+    let (affected, reclaimed) = match input.action.as_str() {
+        "trash" => {
+            let changed = sqlx::query(
+                "UPDATE vault_items SET deleted_at = now(), updated_at = now() WHERE organization_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+            )
+            .bind(&auth.organization_id)
+            .bind(&ids)
+            .execute(&state.pool)
+            .await?
+            .rows_affected();
+            (changed as usize, 0)
+        }
+        "restore" => {
+            let changed = sqlx::query(
+                "UPDATE vault_items SET deleted_at = NULL, updated_at = now() WHERE organization_id = $1 AND id = ANY($2) AND deleted_at IS NOT NULL",
+            )
+            .bind(&auth.organization_id)
+            .bind(&ids)
+            .execute(&state.pool)
+            .await?
+            .rows_affected();
+            (changed as usize, 0)
+        }
+        "purge" => purge_trashed(&state, &auth, Some(ids.clone())).await?,
+        _ => {
+            return Err(AppError::Validation(
+                "action must be trash, restore, or purge".into(),
+            ));
+        }
+    };
+    audit(
+        &state,
+        &auth,
+        &format!("bulk_{}", input.action),
+        None,
+        json!({"itemIds": ids, "affected": affected, "reclaimedBytes": reclaimed}),
+    )
+    .await;
+    Ok(Json(json!({
+        "action": input.action,
+        "affected": affected,
+        "reclaimedBytes": reclaimed,
+    })))
+}
+
+/// `POST /api/v1/trash/empty` — permanently deletes everything in this workspace's trash.
+pub async fn empty_trash(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    let auth = authorize(&state.auth, &headers, "items:delete").await?;
+    if auth.api_key_id.is_none() {
+        require_same_origin(&state, &headers)?;
+    }
+    let (purged, reclaimed) = purge_trashed(&state, &auth, None).await?;
+    audit(
+        &state,
+        &auth,
+        "empty_trash",
+        None,
+        json!({"purged": purged, "reclaimedBytes": reclaimed}),
+    )
+    .await;
+    Ok(Json(json!({"purged": purged, "reclaimedBytes": reclaimed})))
 }
 
 pub(crate) fn require_workspace_manager(auth: &crate::models::AuthContext) -> AppResult<()> {
@@ -1187,14 +1532,16 @@ async fn fetch_item(state: &AppState, organization_id: &str, id: Uuid) -> AppRes
         .ok_or(AppError::NotFound)
 }
 
-async fn workspace_limit(state: &AppState, organization_id: &str) -> AppResult<u64> {
+/// Effective per-file ceiling for a workspace: its own setting, else the server-wide
+/// default chosen by an administrator, always capped by `SERVER_MAX_UPLOAD_BYTES`.
+pub(crate) async fn workspace_limit(state: &AppState, organization_id: &str) -> AppResult<u64> {
     let configured = sqlx::query_scalar::<_, i64>(
-        "SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id = $1",
+        "SELECT coalesce((SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id = $1), (SELECT default_max_upload_bytes FROM vault_server_settings WHERE id), $2)::bigint",
     )
     .bind(organization_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or(104_857_600);
+    .bind(state.server_max_upload_bytes.min(i64::MAX as u64) as i64)
+    .fetch_one(&state.pool)
+    .await?;
     Ok((configured.max(1) as u64).min(state.server_max_upload_bytes))
 }
 
@@ -1235,7 +1582,52 @@ async fn audit(
 
 #[cfg(test)]
 mod tests {
-    use super::search_tsquery;
+    use super::{classify_preview, media_signature, search_tsquery};
+
+    #[test]
+    fn audio_and_video_are_recognised_by_their_bytes() {
+        assert_eq!(
+            media_signature(b"ID3\x04\x00\x00", "mp3"),
+            Some(("audio", "audio/mpeg"))
+        );
+        assert_eq!(
+            media_signature(b"\x00\x00\x00\x18ftypisom", "mp4"),
+            Some(("video", "video/mp4"))
+        );
+        assert_eq!(
+            media_signature(b"\x00\x00\x00\x18ftypM4A ", "m4a"),
+            Some(("audio", "audio/mp4"))
+        );
+        assert_eq!(
+            media_signature(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0], "webm"),
+            Some(("video", "video/webm"))
+        );
+        assert_eq!(
+            media_signature(b"RIFF\x00\x00\x00\x00WAVEfmt ", "wav"),
+            Some(("audio", "audio/wav"))
+        );
+        // Still images in an ISO container are not videos.
+        assert_eq!(media_signature(b"\x00\x00\x00\x1cftypavif", "avif"), None);
+        assert_eq!(media_signature(b"plain text", "txt"), None);
+    }
+
+    #[test]
+    fn svg_previews_as_an_image_not_as_markup() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>"#;
+        let preview = classify_preview(svg, "image/svg+xml", "logo.svg");
+        assert_eq!(preview.kind, "image");
+        assert_eq!(preview.mime, "image/svg+xml");
+    }
+
+    #[test]
+    fn unknown_binary_stays_download_only() {
+        let preview = classify_preview(
+            &[0, 1, 2, 0, 0, 0, 9, 0],
+            "application/octet-stream",
+            "blob.bin",
+        );
+        assert_eq!(preview.kind, "unsupported");
+    }
 
     #[test]
     fn a_single_word_becomes_a_prefix_lexeme() {

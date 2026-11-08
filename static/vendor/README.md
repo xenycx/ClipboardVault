@@ -7,3 +7,5 @@ These browser assets are pinned and served locally so private vault content is n
 - DOMPurify 3.4.11 — MPL-2.0 OR Apache-2.0 — https://github.com/cure53/DOMPurify
 
 Update the versioned files and this manifest together after reviewing upstream release and security notes.
+
+Fonts in `static/fonts/` are IBM Plex Sans and IBM Plex Mono (Latin and Latin Extended subsets, woff2 from @fontsource 5.1.0), licensed under the SIL Open Font License 1.1; see `static/fonts/OFL.txt`.

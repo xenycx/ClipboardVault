@@ -93,7 +93,7 @@ A frontend change commonly touches both `templates/` and `static/`; read both fr
 
 ## System invariants
 
-- Never read or monitor the user's clipboard. Only explicit `navigator.clipboard.writeText` copy actions are allowed.
+- Never read or monitor the user's clipboard. The browser may only touch it on an explicit user gesture: `navigator.clipboard.writeText` for Copy buttons, and the `paste` event's `clipboardData` when the person presses Ctrl/Cmd+V on the vault page. Never call `navigator.clipboard.read`/`readText`, poll, or listen for `clipboardchange`.
 - Never trust identity headers supplied by the public request. Rust removes legacy identity headers and authenticates through the bridge.
 - Never accept a caller-provided organization as authority. Resolve it from the session or verified API key and enforce role or permission checks server-side.
 - Keep `/internal/*` private. Do not expose it through Nginx, and require the bridge secret on every internal auth endpoint.

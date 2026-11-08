@@ -7,6 +7,7 @@ import {
   ownerAc,
 } from "better-auth/plugins/organization/access";
 import { apiKey } from "@better-auth/api-key";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { Pool } from "pg";
 import { providerRegistry } from "./providers.js";
 
@@ -17,6 +18,33 @@ export const pool = new Pool({
 
 const baseURL = (process.env.BETTER_AUTH_URL || "http://localhost:8080").replace(/\/$/, "");
 export const pendingResetTokens = new Map<string, { token: string; expiresAt: number }>();
+
+export type ServerSettings = { registrationEnabled: boolean; requireApproval: boolean };
+
+/**
+ * Server-wide switches stored in the Rust-owned `vault_server_settings` table.
+ * The table arrives with vault migration 0003. Until it exists (for example while
+ * an upgrade is still rolling out) the previous behavior applies: registration is
+ * open and every new account waits for approval.
+ */
+export async function serverSettings(): Promise<ServerSettings> {
+  try {
+    const result = await pool.query(
+      'SELECT registration_enabled AS "registrationEnabled", require_approval AS "requireApproval" FROM vault_server_settings WHERE id',
+    );
+    const row = result.rows[0];
+    if (row) return { registrationEnabled: row.registrationEnabled !== false, requireApproval: row.requireApproval !== false };
+  } catch {
+    // Missing table or transient error: fall back to the safe historical defaults.
+  }
+  return { registrationEnabled: true, requireApproval: true };
+}
+
+const registrationClosed = () =>
+  new APIError("FORBIDDEN", {
+    message: "Registration is closed on this server. Ask an administrator to create your account.",
+    code: "REGISTRATION_CLOSED",
+  });
 
 const workspaceStatements = {
   ...defaultStatements,
@@ -70,6 +98,25 @@ export const auth = betterAuth({
       approvalStatus: { type: "string", required: false, defaultValue: "pending", input: false },
       approvedAt: { type: "date", required: false, input: false },
       approvedBy: { type: "string", required: false, input: false },
+    },
+  },
+  hooks: {
+    before: createAuthMiddleware(async (ctx: { path?: string }) => {
+      if (ctx.path === "/sign-up/email" && !(await serverSettings()).registrationEnabled) {
+        throw registrationClosed();
+      }
+    }),
+  },
+  databaseHooks: {
+    user: {
+      create: {
+        // Also covers first-time social sign-ins, which create users without /sign-up.
+        // Administrators creating accounts and internal server calls are exempt.
+        before: async (_user: unknown, ctx?: { path?: string } | null) => {
+          if (!ctx || ctx.path === "/admin/create-user") return;
+          if (!(await serverSettings()).registrationEnabled) throw registrationClosed();
+        },
+      },
     },
   },
   session: {

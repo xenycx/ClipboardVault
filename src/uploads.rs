@@ -27,7 +27,6 @@ use crate::{
 };
 
 const TUS_VERSION: &str = "1.0.0";
-const DEFAULT_WORKSPACE_LIMIT: u64 = 104_857_600;
 
 #[derive(Debug, Clone, FromRow)]
 struct UploadSession {
@@ -578,14 +577,7 @@ async fn fetch_session(
 }
 
 async fn workspace_limit(state: &AppState, organization_id: &str) -> AppResult<u64> {
-    let value = sqlx::query_scalar::<_, i64>(
-        "SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id=$1",
-    )
-    .bind(organization_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or(DEFAULT_WORKSPACE_LIMIT as i64);
-    Ok(value.max(1) as u64)
+    crate::api::workspace_limit(state, organization_id).await
 }
 
 fn require_tus(headers: &HeaderMap) -> AppResult<()> {

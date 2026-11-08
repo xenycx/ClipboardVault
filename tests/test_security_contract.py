@@ -267,3 +267,60 @@ def test_icon_symbols_used_by_templates_are_defined() -> None:
         markup = template.read_text(encoding="utf-8")
         for used in re.findall(r'<use href="#(i-[a-z-]+)"', markup):
             assert used in defined, f"{template.name} uses undefined icon #{used}"
+
+
+def test_paste_reads_only_the_users_own_paste_gesture() -> None:
+    """Ctrl+V uploads read the paste event the person triggered, never the clipboard API."""
+    client = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'addEventListener("paste"' in client
+    assert "event.clipboardData" in client
+    assert "navigator.clipboard.read" not in client
+
+
+def test_server_settings_migration_is_additive_and_rollback_safe() -> None:
+    migration = (ROOT / "migrations" / "0003_server_settings.sql").read_text(encoding="utf-8")
+    code = "\n".join(line for line in migration.splitlines() if not line.lstrip().startswith("--"))
+    statements = [part.strip().upper() for part in code.split(";") if part.strip()]
+    for statement in statements:
+        assert not statement.startswith(("DROP", "DELETE", "TRUNCATE")), statement
+        assert "DROP COLUMN" not in statement and "RENAME" not in statement, statement
+    assert "CREATE TABLE IF NOT EXISTS vault_server_settings" in code
+    assert "WHERE max_upload_bytes = 104857600" in code
+    auth = (ROOT / "auth" / "src" / "auth.ts").read_text(encoding="utf-8")
+    # The auth service must tolerate the table not existing yet during a rollout.
+    assert "registrationEnabled: true, requireApproval: true" in auth
+
+
+def test_api_key_format_and_verification_are_unchanged() -> None:
+    """Existing production keys must keep working after an upgrade."""
+    auth = (ROOT / "auth" / "src" / "auth.ts").read_text(encoding="utf-8")
+    bridge = (ROOT / "auth" / "src" / "index.ts").read_text(encoding="utf-8")
+    assert 'defaultPrefix: "cv_live_"' in auth
+    assert "auth.api.verifyApiKey" in bridge
+    assert "UPDATE apikey" not in bridge
+
+
+def test_bulk_and_trash_endpoints_require_delete_permission_and_origin() -> None:
+    api = (ROOT / "src" / "api.rs").read_text(encoding="utf-8")
+    for handler in ("pub async fn bulk_items", "pub async fn empty_trash"):
+        body = api.split(handler, 1)[1].split("\npub ", 1)[0]
+        assert 'authorize(&state.auth, &headers, "items:delete")' in body
+        assert "require_same_origin(&state, &headers)" in body
+        assert "auth.organization_id" in body or "purge_trashed(&state, &auth" in body
+
+
+def test_python_client_uses_only_the_standard_library() -> None:
+    client = (ROOT / "static" / "vault.py").read_text(encoding="utf-8")
+    imports = re.findall(r"^(?:from|import) ([a-z0-9_.]+)", client, flags=re.MULTILINE)
+    allowed = {"__future__", "argparse", "base64", "http.client", "json", "mimetypes", "os", "re",
+               "sys", "threading", "time", "urllib.parse", "uuid", "concurrent.futures", "pathlib", "datetime"}
+    assert set(imports) <= allowed, set(imports) - allowed
+    assert 'DEFAULT_SERVER = ""' in client and 'DEFAULT_API_KEY = ""' in client
+    assert "cv_live_" not in client, "never ship a real key in the template"
+
+
+def test_fonts_are_self_hosted() -> None:
+    css = (ROOT / "static" / "app.css").read_text(encoding="utf-8")
+    for reference in re.findall(r'url\("([^"]+)"\)', css):
+        assert not reference.startswith(("http:", "https:", "//"))
+        assert (ROOT / "static" / reference).is_file(), reference

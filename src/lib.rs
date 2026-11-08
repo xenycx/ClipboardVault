@@ -141,6 +141,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/users/{id}/approve", post(pages::approve_user))
         .route("/admin/users/{id}/reject", post(pages::reject_user))
         .route("/admin/users/{id}/reset", post(pages::manual_reset))
+        .route("/admin/settings", post(pages::update_server_settings))
+        .route("/admin/users/create", post(pages::admin_create_user))
+        .route("/admin/users/{id}/role", post(pages::admin_set_role))
+        .route("/admin/users/{id}/ban", post(pages::admin_ban_user))
+        .route("/admin/users/{id}/unban", post(pages::admin_unban_user))
+        .route(
+            "/admin/users/{id}/sessions",
+            post(pages::admin_revoke_sessions),
+        )
+        .route("/admin/users/{id}/delete", post(pages::admin_delete_user))
         .route("/api/v1/items", get(api::list_items).post(api::create_item))
         .route(
             "/api/v1/items/{id}",
@@ -148,6 +158,8 @@ pub fn build_router(state: AppState) -> Router {
                 .patch(api::update_item)
                 .delete(api::delete_item),
         )
+        .route("/api/v1/items/bulk", post(api::bulk_items))
+        .route("/api/v1/trash/empty", post(api::empty_trash))
         .route("/api/v1/items/{id}/restore", post(api::restore_item))
         .route("/api/v1/items/{id}/purge", post(api::purge_item))
         .route(
@@ -216,12 +228,15 @@ async fn security_headers(
             .parse()
             .unwrap(),
     );
-    headers.insert(
-        "content-security-policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self' https://accounts.google.com"
-            .parse()
-            .unwrap(),
-    );
+    // A handler may set a stricter policy (sandboxed SVG previews); keep it.
+    if !headers.contains_key("content-security-policy") {
+        headers.insert(
+            "content-security-policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self' https://accounts.google.com"
+                .parse()
+                .unwrap(),
+        );
+    }
     if tus {
         headers.insert("tus-resumable", "1.0.0".parse().unwrap());
     }

@@ -125,6 +125,17 @@ impl AuthBridge {
             StatusCode::UNAUTHORIZED => return Err(AppError::Unauthorized),
             StatusCode::FORBIDDEN => return Err(AppError::Forbidden),
             StatusCode::NOT_FOUND => return Err(AppError::NotFound),
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT => {
+                // The auth service phrases these for people ("Email already in use").
+                let message = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
+                    .filter(|message| !message.is_empty() && message.len() <= 200)
+                    .unwrap_or_else(|| "The request was rejected".into());
+                return Err(AppError::Validation(message));
+            }
             status if !status.is_success() => return Err(AppError::AuthUnavailable),
             _ => {}
         }

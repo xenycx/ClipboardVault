@@ -246,6 +246,36 @@ fails, the script retags the recorded images, force-recreates only auth and vaul
 old deployment, and returns to the old commit. Backups and rollback image tags are retained;
 prune them only after the new release has been stable and another verified backup exists.
 
+### Upgrading to the administration and bulk-actions release
+
+This release is **migration required, backward compatible**:
+
+- Vault migration `0003_server_settings.sql` runs automatically when the new vault container
+  starts. It only adds the `vault_server_settings` table (registration open, approval required,
+  10 GiB default limit), changes a column default, and moves workspaces still on the old
+  100 MiB product default to 10 GiB. Workspaces with any other explicit limit keep it. The
+  effective limit is always capped by `SERVER_MAX_UPLOAD_BYTES`.
+- No auth schema change. Users, passwords, sessions, organizations, memberships, and **API
+  keys are untouched**: keys keep the `cv_live_` format, stay bound to their workspace, and are
+  verified exactly as before. Keys are not tied to a hostname, so they keep working if the
+  site moves; only the script's `DEFAULT_SERVER` or `VAULT_SERVER` needs the new address.
+- No `.env`, Nginx, or Compose change. The new API routes (`/api/v1/items/bulk`,
+  `/api/v1/trash/empty`) are ordinary small JSON requests under the existing `/api/v1` rules.
+- Deployment order does not matter. The new auth service treats a missing settings table as
+  "registration open, approval required", which is the previous behavior, until the vault
+  migration has run.
+- File layout, Tus sessions, and stored bytes are unchanged; in-flight resumable uploads
+  continue across the upgrade.
+- Browsers fetch the new stylesheet, script, and fonts through the asset fingerprint. Tabs
+  left open from before the upgrade should be reloaded once.
+
+Rollback with `./scripts/upgrade.sh --rollback` is safe: the previous release ignores the new
+table, and the column-default change is harmless to it. Two things do not revert on rollback:
+workspaces moved from 100 MiB to 10 GiB keep the larger limit (lower it in **Keys and team**
+if needed), and the previous release enforces neither "registration closed" nor "approval not
+required"; it behaves as open registration with approval. Accounts disabled in the new
+release stay disabled under the old one, because Better Auth's own ban check enforces them.
+
 ### First rollout of the guarded upgrader
 
 The currently deployed commit may not yet contain `scripts/upgrade.sh`. Fetch the target,

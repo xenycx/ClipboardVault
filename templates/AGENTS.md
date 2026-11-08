@@ -10,7 +10,8 @@ This directory contains Askama HTML templates rendered by `src/pages.rs`. It is 
 - `dashboard.html` owns capture, upload, search, type filters, the trash view, item actions, and the file preview dialog.
 - `login.html`, `setup.html`, `pending.html`, `join.html`, and `reset_password.html` cover the identity lifecycle.
 - `keys.html`, `storage.html`, and `admin.html` cover workspace access, cleanup, and global administration.
-- `one_time_secret.html` displays sensitive values exactly once.
+- `one_time_secret.html` displays sensitive values exactly once; `api_key_created.html` does the same for API keys and offers the personalised `vault.py`.
+- `admin.html` owns server settings (registration, approval, default upload limit), account creation, and per-account actions.
 
 ## Backend/template contract
 

@@ -5,14 +5,12 @@
 {% block auth_card %}
 <div class="card auth-card centered">
   {% if rejected %}
-  <span class="status rejected"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg>Not approved</span>
   <h2>Access was not approved</h2>
   <p>Ask the server administrator if you believe this is a mistake.</p>
   {% else %}
-  <span class="status pending"><svg class="i" aria-hidden="true"><use href="#i-clock"/></svg>Pending review</span>
   <h2>Welcome, {{ name }}</h2>
   <p>Your login works. A global administrator must approve this account before it can see any workspace.</p>
   {% endif %}
-  <button class="button quiet block" type="button" data-signout><svg class="i" aria-hidden="true"><use href="#i-logout"/></svg>Sign out</button>
+  <button class="button block" type="button" data-signout><svg class="i" aria-hidden="true"><use href="#i-logout"/></svg>Sign out</button>
 </div>
 {% endblock %}

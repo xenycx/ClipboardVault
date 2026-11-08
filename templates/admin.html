@@ -1,42 +1,110 @@
 {% extends "app_base.html" %}
-{% block title %}Account approvals &middot; Clipboard Vault{% endblock %}
+{% block title %}Administration &middot; Clipboard Vault{% endblock %}
 {% block crumbs %}
-<h1 class="topbar-heading">Accounts</h1>
-{% if pending > 0 %}<span class="count-chip warn">{{ pending }} waiting</span>{% else %}<span class="count-chip">{{ users.len() }} total</span>{% endif %}
+<h1 class="topbar-heading">Administration</h1>
+{% if pending > 0 %}<span class="count warn">{{ pending }} waiting</span>{% endif %}
 {% endblock %}
 {% block content %}
-<section class="card">
-  <div class="card-head">
-    <div><h2>Account approvals</h2><p class="lede">Approving an account creates its personal workspace. Invited accounts still need approval here.</p></div>
-    <span class="count-chip">{{ users.len() }} accounts</span>
-  </div>
+{% match notice %}
+{% when Some with (notice) %}
+<aside class="banner{% if notice.error %} danger{% else %} ok{% endif %}" role="{% if notice.error %}alert{% else %}status{% endif %}">
+  <svg class="i" aria-hidden="true"><use href="#{% if notice.error %}i-alert{% else %}i-check{% endif %}"/></svg>
+  <p>{{ notice.text }}</p>
+</aside>
+{% when None %}
+{% endmatch %}
+
+<dl class="facts">
+  <div><dt>Accounts</dt><dd>{{ users.len() }}</dd><small>{{ admins }} {% if admins == 1 %}administrator{% else %}administrators{% endif %}</small></div>
+  <div><dt>Workspaces</dt><dd>{{ stats.workspaces }}</dd><small>Each account has its own</small></div>
+  <div><dt>Items</dt><dd>{{ stats.items }}</dd><small>{{ stats.trashed }} in trash</small></div>
+  <div><dt>Stored files</dt><dd>{{ stats.stored_bytes|format_bytes }}</dd><small>Across every workspace</small></div>
+</dl>
+
+<div class="pair">
+  <section class="panel">
+    <header class="panel-head"><h2>Sign-up and limits</h2><p>Applies to the whole server. Changes take effect immediately.</p></header>
+    <form action="/admin/settings" method="post" class="panel-form">
+      <fieldset class="toggles">
+        <legend class="sr-only">Registration</legend>
+        <label class="toggle"><span><strong>Open registration</strong><small>Anyone with the address can create an account. When off, only administrators create accounts.</small></span><input type="checkbox" name="registration_enabled" class="switch" {% if settings.registration_enabled %}checked{% endif %}></label>
+        <label class="toggle"><span><strong>Approve new accounts</strong><small>New accounts wait here for approval. When off, they open their workspace right away.</small></span><input type="checkbox" name="require_approval" class="switch" {% if settings.require_approval %}checked{% endif %}></label>
+      </fieldset>
+      <label class="field"><span>Default upload limit per file (MB)</span><input type="number" name="default_max_upload_mb" min="1" max="{{ server_max_upload_mb }}" value="{{ default_upload_mb }}" required inputmode="numeric"><small>Used by workspaces that have not set their own. Server maximum: {{ server_max_upload_mb }} MB.</small></label>
+      <div class="panel-actions"><button class="button primary" type="submit"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span>Save settings</span></button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <header class="panel-head"><h2>Create an account</h2><p>The account is approved immediately and gets its own workspace. Share the password with the person directly.</p></header>
+    <form action="/admin/users/create" method="post" class="panel-form" autocomplete="off">
+      <div class="field-row">
+        <label class="field"><span>Name</span><input name="name" required maxlength="80" placeholder="Ada Lovelace" autocomplete="off"></label>
+        <label class="field"><span>Email</span><input type="email" name="email" required placeholder="ada@example.com" autocomplete="off"></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Password</span><input type="password" name="password" required minlength="8" maxlength="128" placeholder="At least 8 characters" autocomplete="new-password"></label>
+        <label class="field"><span>Server role</span>
+          <select name="role"><option value="user">Member</option><option value="admin">Administrator</option></select>
+        </label>
+      </div>
+      <div class="panel-actions"><button class="button primary" type="submit"><svg class="i" aria-hidden="true"><use href="#i-user-plus"/></svg><span>Create account</span></button></div>
+    </form>
+  </section>
+</div>
+
+<section class="panel flush">
+  <header class="panel-head row"><h2>Accounts</h2><span class="count">{{ users.len() }}</span></header>
   {% if users.is_empty() %}
-  <div class="empty inline">
-    <span class="empty-art" aria-hidden="true"><svg class="i"><use href="#i-users"/></svg></span>
+  <div class="empty compact">
+    <svg class="i" aria-hidden="true"><use href="#i-users"/></svg>
     <h3>No accounts yet</h3>
-    <p>The first person to register will appear here for review.</p>
+    <p>Create one above, or turn on open registration.</p>
   </div>
   {% else %}
   <div class="table-wrap">
-    <table class="data-table">
-      <thead><tr><th>User</th><th>Status</th><th>Global role</th><th>Created</th><th class="num">Actions</th></tr></thead>
+    <table class="table">
+      <colgroup><col><col class="c-status"><col class="c-role"><col class="c-date"><col class="c-wide-act"></colgroup>
+      <thead><tr><th scope="col">Person</th><th scope="col">Status</th><th scope="col">Server role</th><th scope="col">Joined</th><th scope="col" class="end"><span class="sr-only">Actions</span></th></tr></thead>
       <tbody>
         {% for user in users %}
-        <tr>
-          <td>
-            <span class="person">
-              <span class="avatar" aria-hidden="true">{{ user.name.chars().next().unwrap_or('?') }}</span>
-              <span><span class="cell-strong">{{ user.name }}</span><small>{{ user.email }}</small></span>
-            </span>
-          </td>
-          <td><span class="status {{ user.approval_status }}">{{ user.approval_status }}</span></td>
-          <td>{% if user.role.contains("admin") %}<span class="pill role-admin">admin</span>{% else %}<span class="pill">member</span>{% endif %}</td>
-          <td class="mono subtle">{{ user.created_at }}</td>
-          <td class="num">
+        <tr{% if user.banned %} class="is-muted"{% endif %}>
+          <td><span class="person"><span class="avatar" aria-hidden="true">{{ user.name.chars().next().unwrap_or('?') }}</span><span><strong>{{ user.name }}{% if user.id == session.user.id %} <span class="muted">(you)</span>{% endif %}</strong><small>{{ user.email }}</small></span></span></td>
+          <td>{% if user.banned %}<span class="badge danger">Disabled</span>{% else if user.approval_status == "approved" %}<span class="badge ok">Active</span>{% else if user.approval_status == "pending" %}<span class="badge warn">Waiting</span>{% else %}<span class="badge danger">Rejected</span>{% endif %}</td>
+          <td>{% if user.is_admin() %}<span class="badge accent">Administrator</span>{% else %}<span class="badge">Member</span>{% endif %}</td>
+          <td class="mono muted">{{ user.joined() }}</td>
+          <td class="end">
             <div class="row-actions">
-              {% if user.approval_status != "approved" %}<form action="/admin/users/{{ user.id }}/approve" method="post"><button class="link-btn ok" type="submit">Approve</button></form>{% endif %}
-              {% if user.approval_status != "rejected" && !user.role.contains("admin") %}<form action="/admin/users/{{ user.id }}/reject" method="post"><button class="link-btn danger" type="submit">Reject</button></form>{% endif %}
-              <form action="/admin/users/{{ user.id }}/reset" method="post"><button class="link-btn" type="submit">Reset password</button></form>
+              {% if user.approval_status == "pending" && !user.banned %}
+              <form action="/admin/users/{{ user.id }}/approve" method="post"><button class="button small primary" type="submit">Approve</button></form>
+              {% endif %}
+              <details class="menu align-end">
+                <summary class="icon-btn" aria-label="More actions for {{ user.name }}" title="More actions"><svg class="i" aria-hidden="true"><use href="#i-more"/></svg></summary>
+                <div class="menu-body wide">
+                  {% if user.approval_status != "approved" %}<form action="/admin/users/{{ user.id }}/approve" method="post"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg>Approve</button></form>{% endif %}
+                  {% if user.approval_status != "rejected" && !user.is_admin() %}<form action="/admin/users/{{ user.id }}/reject" method="post"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg>Reject</button></form>{% endif %}
+                  {% if user.is_admin() %}
+                  {% if user.id != session.user.id %}<form action="/admin/users/{{ user.id }}/role" method="post"><input type="hidden" name="role" value="user"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-shield"/></svg>Remove administrator role</button></form>{% endif %}
+                  {% else if !user.banned %}
+                  <form action="/admin/users/{{ user.id }}/role" method="post" data-confirm-submit="Make {{ user.name }} a server administrator? They will be able to manage every account."><input type="hidden" name="role" value="admin"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-shield"/></svg>Make administrator</button></form>
+                  {% endif %}
+                  <form action="/admin/users/{{ user.id }}/reset" method="post"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-key"/></svg>Create password reset link</button></form>
+                  {% if user.id != session.user.id %}
+                  <form action="/admin/users/{{ user.id }}/sessions" method="post"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-logout"/></svg>Sign out everywhere</button></form>
+                  {% if user.banned %}
+                  <form action="/admin/users/{{ user.id }}/unban" method="post"><button class="menu-item" type="submit"><svg class="i" aria-hidden="true"><use href="#i-restore"/></svg>Enable account</button></form>
+                  {% else if !user.is_admin() %}
+                  <form action="/admin/users/{{ user.id }}/ban" method="post" data-confirm-submit="Disable {{ user.name }}? They are signed out and cannot sign in until you enable the account again."><button class="menu-item danger" type="submit"><svg class="i" aria-hidden="true"><use href="#i-ban"/></svg>Disable account</button></form>
+                  {% endif %}
+                  {% if !user.is_admin() %}
+                  <form action="/admin/users/{{ user.id }}/delete" method="post" class="menu-confirm">
+                    <label class="field"><span>Delete account: type <strong>{{ user.email }}</strong></span><input name="confirmation" required autocomplete="off" placeholder="{{ user.email }}"></label>
+                    <button class="button small danger" type="submit">Delete account and its workspace</button>
+                  </form>
+                  {% endif %}
+                  {% endif %}
+                </div>
+              </details>
             </div>
           </td>
         </tr>

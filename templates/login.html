@@ -1,40 +1,47 @@
 {% extends "auth_base.html" %}
 {% block title %}Sign in &middot; Clipboard Vault{% endblock %}
+{% block auth_title %}Sign in to your vault.{% endblock %}
 {% block auth_card %}
 <div class="card auth-card">
+  {% if registration_enabled %}
   <input type="radio" name="auth-mode" id="auth-signin" class="mode-radio" checked>
   <input type="radio" name="auth-mode" id="auth-signup" class="mode-radio">
-  <div class="segmented wide">
+  <div class="segmented wide" role="group" aria-label="Account">
     <label for="auth-signin">Sign in</label>
     <label for="auth-signup">Create account</label>
   </div>
+  {% endif %}
 
   <div class="pane pane-signin">
     <div class="social-providers" data-social-providers hidden aria-label="Social sign-in options"></div>
     <template data-social-provider-template>
-      <button class="button quiet block social-provider" type="button">
+      <button class="button block social-provider" type="button">
         <span class="provider-mark" data-provider-mark aria-hidden="true"></span>
         <span data-provider-label></span>
       </button>
     </template>
-    <div class="divider" data-social-divider hidden><span>or continue with email</span></div>
+    <div class="divider" data-social-divider hidden><span>or use your email</span></div>
     <form data-auth-form="signin" class="stack">
-      <label class="field">Email<input type="email" name="email" autocomplete="email" placeholder="you@example.com" required></label>
-      <label class="field">Password<input type="password" name="password" autocomplete="current-password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" minlength="8" required></label>
-      <button class="button primary block" type="submit">Sign in<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+      <label class="field"><span>Email</span><input type="email" name="email" autocomplete="email" placeholder="you@example.com" required></label>
+      <label class="field"><span>Password</span><input type="password" name="password" autocomplete="current-password" minlength="8" required></label>
+      <button class="button primary block" type="submit" data-auth-submit><span>Sign in</span></button>
     </form>
   </div>
 
+  {% if registration_enabled %}
   <div class="pane pane-signup">
-    <p class="pane-lede">New accounts wait for a server administrator to approve them before any workspace opens.</p>
+    <p class="pane-lede">An administrator may need to approve new accounts before your workspace opens.</p>
     <form data-auth-form="signup" class="stack">
-      <label class="field">Name<input name="name" autocomplete="name" placeholder="Ada Lovelace" required maxlength="80"></label>
-      <label class="field">Email<input type="email" name="email" autocomplete="email" placeholder="you@example.com" required></label>
-      <label class="field">Password<input type="password" name="password" autocomplete="new-password" placeholder="At least 8 characters" minlength="8" maxlength="128" required></label>
-      <button class="button primary block" type="submit">Register for approval<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></button>
+      <label class="field"><span>Name</span><input name="name" autocomplete="name" placeholder="Ada Lovelace" required maxlength="80"></label>
+      <label class="field"><span>Email</span><input type="email" name="email" autocomplete="email" placeholder="you@example.com" required></label>
+      <label class="field"><span>Password</span><input type="password" name="password" autocomplete="new-password" placeholder="At least 8 characters" minlength="8" maxlength="128" required></label>
+      <button class="button primary block" type="submit" data-auth-submit><span>Create account</span></button>
     </form>
   </div>
+  {% else %}
+  <p class="pane-note">New accounts are created by the server administrator.</p>
+  {% endif %}
 
-  <p class="form-error" data-auth-error role="alert"></p>
+  <p class="form-error" data-auth-error role="alert" hidden></p>
 </div>
 {% endblock %}

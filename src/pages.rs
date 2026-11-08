@@ -25,7 +25,9 @@ use sqlx::{Postgres, QueryBuilder};
 
 #[derive(Template)]
 #[template(path = "login.html")]
-struct LoginTemplate;
+struct LoginTemplate {
+    registration_enabled: bool,
+}
 
 #[derive(Template)]
 #[template(path = "pending.html")]
@@ -44,10 +46,12 @@ struct DashboardTemplate {
     session: BridgeSession,
     items: Vec<ItemRow>,
     max_upload_mb: u64,
+    max_upload_bytes: u64,
     nav: &'static str,
     query: String,
     trash: bool,
     chips: Vec<FilterChip>,
+    total: i64,
 }
 
 /// One type filter in the vault toolbar. Hrefs are built server side so the
@@ -97,6 +101,7 @@ struct KeysTemplate {
     server_max_upload_mb: u64,
     can_manage: bool,
     is_owner: bool,
+    server_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,7 +118,6 @@ struct WorkspaceMember {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceDetails {
     members: Vec<WorkspaceMember>,
-    max_upload_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -125,6 +129,61 @@ struct AdminUser {
     approval_status: String,
     role: String,
     created_at: String,
+    #[serde(default)]
+    banned: bool,
+}
+
+impl AdminUser {
+    fn is_admin(&self) -> bool {
+        self.role.split(',').any(|role| role.trim() == "admin")
+    }
+    fn joined(&self) -> String {
+        self.created_at
+            .get(..10)
+            .unwrap_or(&self.created_at)
+            .to_string()
+    }
+}
+
+/// Server-wide settings owned by global administrators (`vault_server_settings`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ServerSettings {
+    pub registration_enabled: bool,
+    pub require_approval: bool,
+    pub default_max_upload_bytes: i64,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            registration_enabled: true,
+            require_approval: true,
+            default_max_upload_bytes: 10_737_418_240,
+        }
+    }
+}
+
+pub(crate) async fn server_settings(pool: &sqlx::PgPool) -> ServerSettings {
+    sqlx::query_as::<_, ServerSettings>(
+        "SELECT registration_enabled, require_approval, default_max_upload_bytes FROM vault_server_settings WHERE id",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+struct AdminStats {
+    workspaces: i64,
+    items: i64,
+    trashed: i64,
+    stored_bytes: i64,
+}
+
+struct Notice {
+    error: bool,
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +198,12 @@ struct AdminTemplate {
     nav: &'static str,
     users: Vec<AdminUser>,
     pending: usize,
+    admins: usize,
+    settings: ServerSettings,
+    default_upload_mb: u64,
+    server_max_upload_mb: u64,
+    stats: AdminStats,
+    notice: Option<Notice>,
 }
 
 #[derive(Template)]
@@ -166,6 +231,16 @@ struct OneTimeSecretTemplate {
     description: String,
     secret: String,
     back_url: String,
+}
+
+#[derive(Template)]
+#[template(path = "api_key_created.html")]
+struct ApiKeyCreatedTemplate {
+    name: String,
+    secret: String,
+    server_url: String,
+    can_read: bool,
+    can_delete: bool,
 }
 
 #[derive(Template)]
@@ -205,8 +280,11 @@ struct DeleteWorkspaceResult {
     storage_keys: Vec<String>,
 }
 
-pub async fn login() -> AppResult<Html<String>> {
-    render(LoginTemplate)
+pub async fn login(State(state): State<AppState>) -> AppResult<Html<String>> {
+    let settings = server_settings(&state.pool).await;
+    render(LoginTemplate {
+        registration_enabled: settings.registration_enabled,
+    })
 }
 pub async fn setup(State(state): State<AppState>) -> AppResult<Html<String>> {
     let configured = sqlx::query_scalar::<_, bool>(
@@ -304,22 +382,19 @@ pub async fn dashboard(
     .fetch_all(&state.pool)
     .await?;
     let chips = build_chips(&counts, kind_filter.as_deref(), &search, trash);
+    let total = counts.iter().map(|(_, count)| count).sum();
 
-    let limit = sqlx::query_scalar::<_, i64>(
-        "SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id = $1",
-    )
-    .bind(&organization_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or(104_857_600) as u64;
+    let limit = api::workspace_limit(&state, &organization_id).await?;
     Ok(render(DashboardTemplate {
         session,
         items,
-        max_upload_mb: limit.min(state.server_max_upload_bytes) / 1024 / 1024,
+        max_upload_mb: limit / 1024 / 1024,
+        max_upload_bytes: limit,
         nav: if trash { "trash" } else { "vault" },
         query: search,
         trash,
         chips,
+        total,
     })?
     .into_response())
 }
@@ -395,6 +470,7 @@ pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResul
         urlencoding(&user_id)
     );
     let details: WorkspaceDetails = state.auth.get_json(&details_path, &[]).await?;
+    let effective_limit = api::workspace_limit(&state, &organization_id).await?;
     let workspace_name = session
         .memberships
         .iter()
@@ -410,10 +486,11 @@ pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResul
         workspace_name,
         keys: list.keys,
         members: details.members,
-        max_upload_mb: details.max_upload_bytes.min(state.server_max_upload_bytes) / 1024 / 1024,
+        max_upload_mb: effective_limit / 1024 / 1024,
         server_max_upload_mb: state.server_max_upload_bytes / 1024 / 1024,
         can_manage,
         is_owner,
+        server_url: state.public_base_url.to_string(),
     })?
     .into_response())
 }
@@ -487,9 +564,43 @@ fn page_auth_context(session: &BridgeSession) -> AppResult<AuthContext> {
     })
 }
 
-pub async fn admin(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
+pub async fn admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> AppResult<Response> {
     let session = approved_session(&state, &headers).await?;
     require_global_admin(&session)?;
+    let notice = query
+        .get("notice")
+        .and_then(|code| notice_text(code))
+        .map(|text| Notice {
+            error: false,
+            text: text.to_string(),
+        });
+    render_admin(&state, session, notice).await
+}
+
+fn notice_text(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "settings" => "Server settings saved.",
+        "created" => "Account created. It is approved and has its own workspace.",
+        "approved" => "Account approved.",
+        "rejected" => "Account rejected.",
+        "role" => "Global role updated.",
+        "banned" => "Account disabled and signed out everywhere.",
+        "unbanned" => "Account enabled. The person can sign in again.",
+        "sessions" => "Every session for that account was signed out.",
+        "deleted" => "Account deleted.",
+        _ => return None,
+    })
+}
+
+async fn render_admin(
+    state: &AppState,
+    session: BridgeSession,
+    notice: Option<Notice>,
+) -> AppResult<Response> {
     let path = format!(
         "/internal/admin/users?requesterId={}",
         urlencoding(&session.user.id)
@@ -506,13 +617,248 @@ pub async fn admin(State(state): State<AppState>, headers: HeaderMap) -> AppResu
         .iter()
         .filter(|user| user.approval_status == "pending")
         .count();
+    let admins = users.iter().filter(|user| user.is_admin()).count();
+    let settings = server_settings(&state.pool).await;
+    let (items, trashed) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT (count(*) FILTER (WHERE deleted_at IS NULL))::bigint, (count(*) FILTER (WHERE deleted_at IS NOT NULL))::bigint FROM vault_items",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let stored_bytes = sqlx::query_scalar::<_, i64>(
+        "SELECT least(coalesce(sum(size_bytes), 0), 9223372036854775807)::bigint FROM vault_blobs",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let workspaces = sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM organization")
+        .fetch_one(&state.pool)
+        .await?;
+    let default_upload_mb = (settings.default_max_upload_bytes.max(1) as u64)
+        .min(state.server_max_upload_bytes)
+        / 1024
+        / 1024;
     Ok(render(AdminTemplate {
         session,
         nav: "admin",
         users,
         pending,
+        admins,
+        settings,
+        default_upload_mb,
+        server_max_upload_mb: state.server_max_upload_bytes / 1024 / 1024,
+        stats: AdminStats {
+            workspaces,
+            items,
+            trashed,
+            stored_bytes,
+        },
+        notice,
     })?
     .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct ServerSettingsForm {
+    #[serde(default)]
+    registration_enabled: Option<String>,
+    #[serde(default)]
+    require_approval: Option<String>,
+    default_max_upload_mb: u64,
+}
+
+pub async fn update_server_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ServerSettingsForm>,
+) -> AppResult<Redirect> {
+    let session = approved_session(&state, &headers).await?;
+    require_global_admin(&session)?;
+    let bytes = form
+        .default_max_upload_mb
+        .max(1)
+        .saturating_mul(1024 * 1024)
+        .min(state.server_max_upload_bytes) as i64;
+    sqlx::query(
+        r#"INSERT INTO vault_server_settings
+             (id, registration_enabled, require_approval, default_max_upload_bytes, updated_by_user_id)
+           VALUES (TRUE, $1, $2, $3, $4)
+           ON CONFLICT (id) DO UPDATE SET
+             registration_enabled = EXCLUDED.registration_enabled,
+             require_approval = EXCLUDED.require_approval,
+             default_max_upload_bytes = EXCLUDED.default_max_upload_bytes,
+             updated_by_user_id = EXCLUDED.updated_by_user_id,
+             updated_at = now()"#,
+    )
+    .bind(form.registration_enabled.is_some())
+    .bind(form.require_approval.is_some())
+    .bind(bytes)
+    .bind(&session.user.id)
+    .execute(&state.pool)
+    .await?;
+    Ok(Redirect::to("/admin?notice=settings"))
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserForm {
+    name: String,
+    email: String,
+    password: String,
+    #[serde(default)]
+    role: String,
+}
+
+pub async fn admin_create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateUserForm>,
+) -> AppResult<Response> {
+    let role = if form.role == "admin" {
+        "admin"
+    } else {
+        "user"
+    };
+    let body = json!({
+        "name": form.name.trim(),
+        "email": form.email.trim(),
+        "password": form.password,
+        "role": role,
+    });
+    admin_bridge_action(
+        &state,
+        &headers,
+        "/internal/admin/create-user",
+        body,
+        "created",
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct RoleForm {
+    role: String,
+}
+
+pub async fn admin_set_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<RoleForm>,
+) -> AppResult<Response> {
+    let role = if form.role == "admin" {
+        "admin"
+    } else {
+        "user"
+    };
+    let body = json!({"userId": id, "role": role});
+    admin_bridge_action(&state, &headers, "/internal/admin/set-role", body, "role").await
+}
+
+pub async fn admin_ban_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    let body = json!({"userId": id, "banned": true});
+    admin_bridge_action(&state, &headers, "/internal/admin/ban", body, "banned").await
+}
+
+pub async fn admin_unban_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    let body = json!({"userId": id, "banned": false});
+    admin_bridge_action(&state, &headers, "/internal/admin/ban", body, "unbanned").await
+}
+
+pub async fn admin_revoke_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    let body = json!({"userId": id});
+    admin_bridge_action(
+        &state,
+        &headers,
+        "/internal/admin/revoke-sessions",
+        body,
+        "sessions",
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct DeleteUserForm {
+    confirmation: String,
+}
+
+pub async fn admin_delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteUserForm>,
+) -> AppResult<Response> {
+    let session = approved_session(&state, &headers).await?;
+    require_global_admin(&session)?;
+    let body = json!({
+        "requesterId": &session.user.id,
+        "userId": id,
+        "confirmation": form.confirmation.trim(),
+    });
+    match state
+        .auth
+        .post_json::<_, DeleteWorkspaceResult>("/internal/admin/delete-user", &body, &[])
+        .await
+    {
+        Ok(result) => {
+            api::remove_storage_keys(&state, result.storage_keys).await;
+            Ok(Redirect::to("/admin?notice=deleted").into_response())
+        }
+        Err(AppError::Validation(message)) => {
+            render_admin(
+                &state,
+                session,
+                Some(Notice {
+                    error: true,
+                    text: message,
+                }),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs one global-admin command on the auth bridge. Business-rule refusals come
+/// back as validation errors and are shown on the admin page instead of a JSON body.
+async fn admin_bridge_action(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    mut body: serde_json::Value,
+    notice: &str,
+) -> AppResult<Response> {
+    let session = approved_session(state, headers).await?;
+    require_global_admin(&session)?;
+    body["requesterId"] = json!(&session.user.id);
+    match state
+        .auth
+        .post_json::<_, serde_json::Value>(path, &body, &[])
+        .await
+    {
+        Ok(_) => Ok(Redirect::to(&format!("/admin?notice={notice}")).into_response()),
+        Err(AppError::Validation(message)) => {
+            render_admin(
+                state,
+                session,
+                Some(Notice {
+                    error: true,
+                    text: message,
+                }),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub async fn reset_password(
@@ -688,17 +1034,15 @@ pub async fn delete_workspace(
         .auth
         .post_json("/internal/workspaces/delete", &body, &[])
         .await?;
-    for storage_key in result.storage_keys.into_iter().chain(temp_storage_keys) {
-        let path = std::path::Path::new(&storage_key);
-        if path
-            .components()
-            .all(|part| matches!(part, std::path::Component::Normal(_)))
-            && let Err(error) = tokio::fs::remove_file(state.upload_root.join(path)).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, %storage_key, "failed to remove deleted workspace file");
-        }
-    }
+    api::remove_storage_keys(
+        &state,
+        result
+            .storage_keys
+            .into_iter()
+            .chain(temp_storage_keys)
+            .collect(),
+    )
+    .await;
     let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -788,17 +1132,18 @@ pub async fn create_key(
     }
     let body = json!({
         "organizationId": organization_id, "requesterId": session.user.id,
-        "name": form.name, "expiresInDays": form.expires_in_days.clamp(1, 3650), "permissions": permissions,
+        "name": &form.name, "expiresInDays": form.expires_in_days.clamp(1, 3650), "permissions": permissions,
     });
     let result: SecretResult = state
         .auth
         .post_json("/internal/api-keys", &body, &[])
         .await?;
-    render(OneTimeSecretTemplate {
-        title: "API key created".into(),
-        description: "Copy this key now. It will never be shown again.".into(),
+    render(ApiKeyCreatedTemplate {
+        name: form.name.trim().chars().take(80).collect(),
         secret: result.secret,
-        back_url: "/keys".into(),
+        server_url: state.public_base_url.to_string(),
+        can_read: form.read.is_some(),
+        can_delete: form.delete.is_some(),
     })
 }
 
@@ -884,7 +1229,7 @@ pub async fn approve_user(
     Path(id): Path<String>,
 ) -> AppResult<Redirect> {
     admin_mutation(&state, &headers, &id, "approve").await?;
-    Ok(Redirect::to("/admin"))
+    Ok(Redirect::to("/admin?notice=approved"))
 }
 pub async fn reject_user(
     State(state): State<AppState>,
@@ -892,7 +1237,7 @@ pub async fn reject_user(
     Path(id): Path<String>,
 ) -> AppResult<Redirect> {
     admin_mutation(&state, &headers, &id, "reject").await?;
-    Ok(Redirect::to("/admin"))
+    Ok(Redirect::to("/admin?notice=rejected"))
 }
 async fn admin_mutation(
     state: &AppState,
@@ -982,7 +1327,11 @@ mod tests {
 
     #[test]
     fn rendered_pages_request_versioned_assets() {
-        let html = LoginTemplate.render().unwrap();
+        let html = LoginTemplate {
+            registration_enabled: true,
+        }
+        .render()
+        .unwrap();
         for asset in [
             "/static/app.css?v=",
             "/static/app.js?v=",
@@ -995,7 +1344,11 @@ mod tests {
     #[test]
     fn rendered_pages_carry_no_inline_script() {
         // script-src 'self' means an inline script or handler silently does nothing.
-        let html = LoginTemplate.render().unwrap();
+        let html = LoginTemplate {
+            registration_enabled: true,
+        }
+        .render()
+        .unwrap();
         assert!(!html.contains("<script>"));
         assert!(!html.contains("onclick="));
         assert!(!html.contains("onchange="));

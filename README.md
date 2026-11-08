@@ -19,8 +19,10 @@ stores searchable metadata; file bytes stay on a persistent VPS volume.
 - Trash, restore, search, tags, exports, and activity records.
 - Docker Compose, Nginx, Certbot, health checks, and GitHub Actions.
 
-Clipboard Vault never reads the browser clipboard. The only clipboard operation is an
-explicit Copy button clicked by the user.
+Clipboard Vault never reads or monitors the browser clipboard on its own. It sees clipboard
+data in exactly two moments the user initiates: pressing Ctrl+V (or Cmd+V) on the vault page,
+which saves the pasted image or puts pasted text into the capture box, and clicking a Copy
+button, which writes to the clipboard.
 
 ## Architecture
 
@@ -138,6 +140,17 @@ require HTTPS and normally cannot use a raw VPS IP address.
 - No email service runs. A global admin can create a one-time password-reset link and send
   it to the user manually.
 
+Global administrators manage the server from **Administration**:
+
+- Open or close registration. When closed, `/sign-up/email` and first-time social sign-ins
+  are refused, and only administrators create accounts.
+- Require approval for new accounts, or let them open their workspace immediately.
+- Set the default per-file upload limit (10 GiB unless lowered; capped by
+  `SERVER_MAX_UPLOAD_BYTES`). Workspace owners can still choose their own limit.
+- Create approved accounts with a password, grant or remove the administrator role, disable
+  and re-enable accounts, sign an account out everywhere, issue reset links, and delete an
+  account together with the workspaces only it owns.
+
 The first admin is protected by the private `BOOTSTRAP_TOKEN`. Choose a random value,
 register the intended account, visit `/setup`, and claim the instance before sharing
 the site.
@@ -187,9 +200,31 @@ reserve. Clipboard Vault never deletes files automatically.
 
 Soft-deleted items are listed with `GET /api/v1/items?trash=true`, restored with
 `POST /api/v1/items/{id}/restore`, and permanently removed with
-`POST /api/v1/items/{id}/purge`.
+`POST /api/v1/items/{id}/purge`. Several items at once go through
+`POST /api/v1/items/bulk` with `{"action": "trash" | "restore" | "purge", "ids": [...]}`
+(purge only affects items already in trash), and `POST /api/v1/trash/empty` permanently deletes
+the whole trash. Both need the `items:delete` permission.
 
-### Python uploader
+### Python client (no dependencies)
+
+`static/vault.py` is a single-file command-line client that uses only the Python standard
+library (3.8+). Creating a key in the browser offers a copy with the server address and the
+new key filled in; **Keys and team** also links a blank copy that reads `VAULT_SERVER` and
+`VAULT_API_KEY` from the environment.
+
+```bash
+python vault.py up report.pdf screenshots/        # parallel, resumable uploads of any size
+python vault.py ls invoice                        # search
+python vault.py get 3f2a9c1e -o ~/Downloads        # resumable download (IDs can be shortened)
+git diff | python vault.py paste --tag diff       # save text from stdin
+python vault.py cat 3f2a9c1e                       # print to stdout
+python vault.py rm 3f2a9c1e && python vault.py empty-trash --yes
+```
+
+Files up to 90 MiB stream through one multipart request; larger files (or `--resumable`)
+use Tus and resume automatically when the command is run again.
+
+### Older Python examples
 
 ```bash
 python -m pip install requests
@@ -217,8 +252,11 @@ known session from the authoritative server offset.
 The dashboard loads previews only when requested. Text and code are syntax-highlighted up to
 1 MiB, displayed as plain text up to 10 MiB, and truncated to the first 10 MiB above that.
 Markdown and HTML rendered previews are sanitized and always retain an inert source view.
-Common raster images up to 50 MiB and PDFs are displayed inline; PDF and download responses
-support byte ranges. The original Download action remains available for every file, including
+Common raster images up to 50 MiB, SVG (rendered as an image inside a sandboxing CSP), PDFs,
+and browser-playable audio and video (MP3, M4A, WAV, FLAC, Ogg, MP4, MOV, WebM) are displayed
+inline; media, PDF, and download responses support byte ranges. Pasted text opens in a reader
+with line wrapping, Markdown and HTML rendering, syntax highlighting, copy, and a `.txt`
+download. The original Download action remains available for every file, including
 files that are unsafe or too large to preview.
 
 The API returns a consistent error body:
@@ -242,7 +280,9 @@ The API returns a consistent error body:
 | `GET/PATCH/DELETE` | `/api/v1/items/{id}` | Read, edit metadata, or move an item to trash |
 | `POST` | `/api/v1/items/{id}/restore` | Restore a trashed item |
 | `POST` | `/api/v1/items/{id}/purge` | Permanently remove a trashed item and unreferenced bytes |
-| `GET/HEAD` | `/api/v1/items/{id}/content` | Stream stored bytes; supports Range and `?download=1` |
+| `POST` | `/api/v1/items/bulk` | Trash, restore, or purge up to 1,000 items in one request |
+| `POST` | `/api/v1/trash/empty` | Permanently delete every trashed item in the workspace |
+| `GET/HEAD` | `/api/v1/items/{id}/content` | Stream stored bytes (or a text item as `.txt`); supports Range and `?download=1` |
 | `GET/HEAD` | `/api/v1/items/{id}/preview` | Stream a classified, authenticated preview response |
 | `OPTIONS/POST` | `/api/v1/uploads` | Discover Tus support or create a resumable upload |
 | `GET/HEAD/PATCH/DELETE` | `/api/v1/uploads/{id}` | Read status, inspect offset, append, or cancel a Tus upload |
