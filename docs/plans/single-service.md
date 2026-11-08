@@ -311,9 +311,10 @@ db `5de4da19`) on the 8gb host.
 
    The 2.x `DB_PASSWORD` is visible under the db service's variables in RivetPanel. Stop if
    the count report shows any mismatch.
-5. **Switch the domain:** remove `vault.xenyc.ge` from the 2.x site, add and verify it on the
-   3.0 site (the TXT record already exists), and set `PUBLIC_BASE_URL=https://vault.xenyc.ge`
-   on the 3.0 app. Traefik needs no change; it already sends the host to RivetPanel's sites.
+5. **Switch the domain:** remove `vault.xenyc.ge` from the 2.x site and add it to the 3.0 site.
+   RivetPanel issues a new verification value on every add, so the TXT record's value must be
+   replaced in DNS before the domain verifies (done 2026-11-08; about 3 minutes of DNS wait).
+   Set `PUBLIC_BASE_URL=https://vault.xenyc.ge` on the 3.0 app. Traefik needs no change.
 6. **Verify:** `/health/ready`, sign in (expected once), open an image and a long text item,
    upload through the browser and through `vault.py`, and list with an existing API key.
 7. **Keep 2.x stopped, not deleted,** for at least a week. To roll back, move the domain back

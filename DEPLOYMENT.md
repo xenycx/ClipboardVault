@@ -607,9 +607,13 @@ published and the 3.0 template in the catalog (see
 6. **Import:** run the same command without `--dry-run`. Stop if the count report shows any
    mismatch.
 7. **Start the 3.0 app** in RivetPanel.
-8. **Switch the domain:** remove `vault.xenyc.ge` from the 2.x site, add and verify it on the
-   3.0 site (the TXT record already exists), and set `PUBLIC_BASE_URL=https://vault.xenyc.ge`
-   on the 3.0 app. Traefik needs no change; it already sends the host to RivetPanel's sites.
+8. **Switch the domain:** remove `vault.xenyc.ge` from the 2.x site and add it to the 3.0 site.
+   RivetPanel issues a new random verification value each time a domain is added to a site, so
+   replace the value of the `_rivetpanel-verify.vault.xenyc.ge` TXT record in DNS with the new
+   one the 3.0 site shows, then verify. The domain is not served between removal and
+   verification. Set `PUBLIC_BASE_URL=https://vault.xenyc.ge` on the 3.0 app (sign-ins are
+   refused with `INVALID_ORIGIN` until it matches). Traefik needs no change; it already sends
+   the host to RivetPanel's sites. Moving back for a rollback needs another TXT change.
 9. **Verify:** `/health/ready`, sign in (expected once), open an image and a long text item,
    upload through the browser and through `vault.py`, and list with an existing API key. A
    Cloudflare challenge blocks curl from the server to the public URL, so check health on the
