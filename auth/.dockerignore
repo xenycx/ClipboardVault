@@ -1,8 +1,0 @@
-.git
-.env
-.env.*
-coverage
-dist
-node_modules
-*.log
-pnpm-debug.log*

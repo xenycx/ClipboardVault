@@ -13,7 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::authorize,
+    db::{self, Id},
     error::{AppError, AppResult},
     models::{ItemCreate, ItemListResponse, ItemPatch, ItemRow, ListQuery},
     storage::{
@@ -37,16 +38,15 @@ pub async fn live() -> Json<Value> {
 }
 
 pub async fn ready(State(state): State<AppState>) -> AppResult<Json<Value>> {
-    sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM server_settings")
+        .fetch_one(&state.db.read)
         .await?;
-    let _: Value = state.auth.get_json("/health", &[]).await?;
     Ok(Json(json!({"status": "ready"})))
 }
 
 pub async fn create_item(State(state): State<AppState>, request: Request) -> AppResult<Response> {
     let headers = request.headers().clone();
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     let declared_request_bytes = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -93,13 +93,15 @@ pub async fn create_text_item(
     let source_url = validate_source_url(input.source_url)?;
     let content_hash = hex::encode(Sha256::digest(payload.as_bytes()));
 
+    let now = db::now();
     let item = sqlx::query_as::<_, ItemRow>(
         r#"INSERT INTO vault_items
-           (organization_id, created_by_user_id, created_by_key_id, kind, text_payload,
-            virtual_path, source_url, tags, content_hash, size_bytes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           (id, organization_id, created_by_user_id, created_by_key_id, kind, text_payload,
+            virtual_path, source_url, tags, content_hash, size_bytes, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            RETURNING *"#,
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(&auth.organization_id)
     .bind(&auth.user_id)
     .bind(&auth.api_key_id)
@@ -110,7 +112,9 @@ pub async fn create_text_item(
     .bind(json!(tags))
     .bind(&content_hash)
     .bind(size as i64)
-    .fetch_one(&state.pool)
+    .bind(&now)
+    .bind(&now)
+    .fetch_one(&state.db.write)
     .await?;
     audit(state, &auth, "create", Some(item.id), json!({"kind": kind})).await;
     Ok((StatusCode::CREATED, Json(item)).into_response())
@@ -125,18 +129,12 @@ async fn create_file_item(
     let limit = workspace_limit(state, &auth.organization_id)
         .await?
         .min(state.legacy_max_upload_bytes);
-    let mut tx = state.pool.begin().await?;
-    // Serialize legacy admission with Tus session creation so concurrent
-    // uploads cannot collectively consume the protected disk reserve.
-    sqlx::query("SELECT pg_advisory_xact_lock(192837465)")
-        .execute(&mut *tx)
-        .await?;
-    let outstanding = sqlx::query_scalar::<_, i64>(
-        "SELECT least(coalesce(sum(expected_bytes - acknowledged_bytes), 0), 9223372036854775807)::bigint FROM vault_upload_sessions WHERE state = 'uploading' AND expires_at > now()",
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .max(0) as u64;
+    // Serialize legacy admission with Tus session creation so concurrent uploads
+    // cannot collectively consume the protected disk reserve. This is an
+    // in-process lock: the database write connection is never held while bytes
+    // stream in.
+    let admission = state.upload_admission.lock().await;
+    let outstanding = crate::uploads::outstanding_reservations(state).await?;
     let available = crate::uploads::available_space(&state.upload_root)?;
     let incoming = declared_request_bytes.unwrap_or_else(|| limit.saturating_add(1024 * 1024));
     let required = state
@@ -191,22 +189,20 @@ async fn create_file_item(
             required,
         });
     }
-    let (blob, blob_created) = persist_blob(
-        &mut tx,
-        &state.pool,
-        &state.upload_root,
-        &auth.organization_id,
-        &upload,
-    )
-    .await?;
+    let mut tx = state.db.begin().await?;
+    let (blob, blob_created) =
+        persist_blob(&mut tx, &state.upload_root, &auth.organization_id, &upload).await?;
     let kind = file_kind(&blob.mime_type);
+    let now = db::now();
     let item_result = sqlx::query_as::<_, ItemRow>(
         r#"INSERT INTO vault_items
-           (organization_id, created_by_user_id, created_by_key_id, kind, blob_id,
-            original_filename, virtual_path, source_url, tags, content_hash, size_bytes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           (id, organization_id, created_by_user_id, created_by_key_id, kind, blob_id,
+            original_filename, virtual_path, source_url, tags, content_hash, size_bytes,
+            created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            RETURNING *"#,
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(&auth.organization_id)
     .bind(&auth.user_id)
     .bind(&auth.api_key_id)
@@ -218,6 +214,8 @@ async fn create_file_item(
     .bind(json!(tags))
     .bind(&upload.sha256)
     .bind(upload.size_bytes as i64)
+    .bind(&now)
+    .bind(&now)
     .fetch_one(&mut *tx)
     .await;
     let item = match item_result {
@@ -230,7 +228,13 @@ async fn create_file_item(
             return Err(error.into());
         }
     };
-    tx.commit().await?;
+    if let Err(error) = tx.commit().await {
+        if blob_created {
+            let _ = tokio::fs::remove_file(state.upload_root.join(&blob.storage_key)).await;
+        }
+        return Err(error.into());
+    }
+    drop(admission);
     audit(
         state,
         &auth,
@@ -242,37 +246,39 @@ async fn create_file_item(
     Ok((StatusCode::CREATED, Json(item)).into_response())
 }
 
-/// Turns free text into a prefix `tsquery`: `depl loc` becomes `depl:* & loc:*`.
+/// Turns free text into an FTS5 prefix query: `depl loc` becomes
+/// `"depl"* AND "loc"*`.
 ///
 /// Prefix matching is what makes typing part of a word feel like search, and it
-/// still rides the `vault_items_search_idx` GIN index. `ILIKE '%term%'` would not.
-/// Returns `None` when nothing searchable is left, so callers can skip the clause.
-pub(crate) fn search_tsquery(input: &str) -> Option<String> {
-    let lexemes: Vec<String> = input
+/// rides the `vault_items_fts` index. Words are split on anything that is not a
+/// letter or digit, so no FTS5 syntax (quotes, `:`, `*`, `NEAR`, `-`) from the
+/// input ever reaches the query; each word is also quoted. Returns `None` when
+/// nothing searchable is left, so callers can skip the clause.
+pub(crate) fn search_query(input: &str) -> Option<String> {
+    let terms: Vec<String> = input
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .take(8)
         .map(|word| {
-            let mut lexeme: String = word.chars().take(48).collect::<String>().to_lowercase();
-            lexeme.push_str(":*");
-            lexeme
+            let term: String = word.chars().take(48).collect::<String>().to_lowercase();
+            format!("\"{}\"*", term.replace('"', "\"\""))
         })
         .collect();
-    if lexemes.is_empty() {
+    if terms.is_empty() {
         None
     } else {
-        Some(lexemes.join(" & "))
+        Some(terms.join(" AND "))
     }
 }
 
 /// Adds the shared full-text condition so the page and the API agree on results.
-pub(crate) fn push_search(builder: &mut QueryBuilder<'_, Postgres>, input: &str) {
-    let Some(tsquery) = search_tsquery(input) else {
+pub(crate) fn push_search(builder: &mut QueryBuilder<'_, Sqlite>, input: &str) {
+    let Some(query) = search_query(input) else {
         return;
     };
     builder
-        .push(" AND to_tsvector('simple', coalesce(text_payload,'') || ' ' || coalesce(original_filename,'') || ' ' || virtual_path) @@ to_tsquery('simple', ")
-        .push_bind(tsquery)
+        .push(" AND seq IN (SELECT rowid FROM vault_items_fts WHERE vault_items_fts MATCH ")
+        .push_bind(query)
         .push(")");
 }
 
@@ -281,10 +287,10 @@ pub async fn list_items(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> AppResult<Json<ItemListResponse>> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let mut builder =
-        QueryBuilder::<Postgres>::new("SELECT * FROM vault_items WHERE organization_id = ");
+        QueryBuilder::<Sqlite>::new("SELECT * FROM vault_items WHERE organization_id = ");
     builder.push_bind(&auth.organization_id);
     if query.trash.unwrap_or(false) {
         builder.push(" AND deleted_at IS NOT NULL");
@@ -295,10 +301,13 @@ pub async fn list_items(
         builder.push(" AND kind = ").push_bind(kind);
     }
     if let Some(before) = query.before {
-        builder.push(" AND created_at < ").push_bind(before);
+        builder.push(" AND created_at < ").push_bind(db::ts(before));
     }
     if let Some(tag) = query.tag {
-        builder.push(" AND tags ? ").push_bind(tag);
+        builder
+            .push(" AND EXISTS (SELECT 1 FROM json_each(vault_items.tags) WHERE value = ")
+            .push_bind(tag)
+            .push(")");
     }
     if let Some(q) = query.q.as_deref() {
         push_search(&mut builder, q);
@@ -308,7 +317,7 @@ pub async fn list_items(
         .push_bind(limit + 1);
     let mut items = builder
         .build_query_as::<ItemRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&state.db.read)
         .await?;
     let has_more = items.len() as i64 > limit;
     if has_more {
@@ -327,7 +336,7 @@ pub async fn get_item(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ItemRow>> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
     Ok(Json(fetch_item(&state, &auth.organization_id, id).await?))
 }
 
@@ -337,7 +346,7 @@ pub async fn update_item(
     Path(id): Path<Uuid>,
     Json(input): Json<ItemPatch>,
 ) -> AppResult<Json<ItemRow>> {
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     let virtual_path = input
         .virtual_path
         .as_deref()
@@ -353,22 +362,23 @@ pub async fn update_item(
     let source_url = validate_source_url(source_url)?;
     let item = sqlx::query_as::<_, ItemRow>(
         r#"UPDATE vault_items SET
-           virtual_path = COALESCE($3, virtual_path), tags = COALESCE($4, tags),
-           source_url = CASE WHEN $5 THEN $6 ELSE source_url END,
-           pinned = COALESCE($7, pinned), updated_at = now()
-           WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL RETURNING *"#,
+           virtual_path = COALESCE(?3, virtual_path), tags = COALESCE(?4, tags),
+           source_url = CASE WHEN ?5 THEN ?6 ELSE source_url END,
+           pinned = COALESCE(?7, pinned), updated_at = ?8
+           WHERE id = ?1 AND organization_id = ?2 AND deleted_at IS NULL RETURNING *"#,
     )
-    .bind(id)
+    .bind(id.hyphenated())
     .bind(&auth.organization_id)
     .bind(virtual_path)
     .bind(tags)
     .bind(has_source_url)
     .bind(source_url)
     .bind(input.pinned)
-    .fetch_optional(&state.pool)
+    .bind(db::now())
+    .fetch_optional(&state.db.write)
     .await?
     .ok_or(AppError::NotFound)?;
-    audit(&state, &auth, "update", Some(id), json!({})).await;
+    audit(&state, &auth, "update", Some(id.hyphenated()), json!({})).await;
     Ok(Json(item))
 }
 
@@ -377,13 +387,14 @@ pub async fn delete_item(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let auth = authorize(&state.auth, &headers, "items:delete").await?;
-    let changed = sqlx::query("UPDATE vault_items SET deleted_at = now(), updated_at = now() WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL")
-        .bind(id).bind(&auth.organization_id).execute(&state.pool).await?.rows_affected();
+    let auth = authorize(&state, &headers, "items:delete").await?;
+    let now = db::now();
+    let changed = sqlx::query("UPDATE vault_items SET deleted_at = ?, updated_at = ? WHERE id = ? AND organization_id = ? AND deleted_at IS NULL")
+        .bind(&now).bind(&now).bind(id.hyphenated()).bind(&auth.organization_id).execute(&state.db.write).await?.rows_affected();
     if changed == 0 {
         return Err(AppError::NotFound);
     }
-    audit(&state, &auth, "delete", Some(id), json!({})).await;
+    audit(&state, &auth, "delete", Some(id.hyphenated()), json!({})).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -392,11 +403,11 @@ pub async fn restore_item(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ItemRow>> {
-    let auth = authorize(&state.auth, &headers, "items:delete").await?;
+    let auth = authorize(&state, &headers, "items:delete").await?;
     let item = sqlx::query_as::<_, ItemRow>(
-        "UPDATE vault_items SET deleted_at = NULL, updated_at = now() WHERE id = $1 AND organization_id = $2 AND deleted_at IS NOT NULL RETURNING *",
-    ).bind(id).bind(&auth.organization_id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
-    audit(&state, &auth, "restore", Some(id), json!({})).await;
+        "UPDATE vault_items SET deleted_at = NULL, updated_at = ? WHERE id = ? AND organization_id = ? AND deleted_at IS NOT NULL RETURNING *",
+    ).bind(db::now()).bind(id.hyphenated()).bind(&auth.organization_id).fetch_optional(&state.db.write).await?.ok_or(AppError::NotFound)?;
+    audit(&state, &auth, "restore", Some(id.hyphenated()), json!({})).await;
     Ok(Json(item))
 }
 
@@ -405,52 +416,19 @@ pub async fn purge_item(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let auth = authorize(&state.auth, &headers, "items:delete").await?;
-    let mut tx = state.pool.begin().await?;
-    let blob = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(
-        r#"SELECT i.blob_id, b.storage_key FROM vault_items i
-           LEFT JOIN vault_blobs b ON b.id = i.blob_id
-           WHERE i.id = $1 AND i.organization_id = $2 AND i.deleted_at IS NOT NULL
-           FOR UPDATE OF i"#,
+    let auth = authorize(&state, &headers, "items:delete").await?;
+    let mut tx = state.db.begin().await?;
+    let row = sqlx::query_as::<_, (Id, Option<Id>)>(
+        "SELECT id, blob_id FROM vault_items WHERE id = ? AND organization_id = ? AND deleted_at IS NOT NULL",
     )
-    .bind(id)
+    .bind(id.hyphenated())
     .bind(&auth.organization_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(AppError::NotFound)?;
-    sqlx::query("DELETE FROM vault_items WHERE id = $1 AND organization_id = $2")
-        .bind(id)
-        .bind(&auth.organization_id)
-        .execute(&mut *tx)
-        .await?;
-    let mut remove_storage = None;
-    if let Some(blob_id) = blob.0 {
-        let references = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*)::bigint FROM vault_items WHERE blob_id = $1",
-        )
-        .bind(blob_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if references == 0 {
-            sqlx::query("DELETE FROM vault_blobs WHERE id = $1")
-                .bind(blob_id)
-                .execute(&mut *tx)
-                .await?;
-            remove_storage = blob.1;
-        }
-    }
+    let (keys, _) = delete_items_and_orphans(&mut tx, &auth.organization_id, &[row]).await?;
     tx.commit().await?;
-    if let Some(storage_key) = remove_storage {
-        let path = std::path::Path::new(&storage_key);
-        if path
-            .components()
-            .all(|part| matches!(part, std::path::Component::Normal(_)))
-            && let Err(error) = tokio::fs::remove_file(state.upload_root.join(path)).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, %storage_key, "failed to remove purged blob");
-        }
-    }
+    remove_storage_keys(&state, keys).await;
     audit(&state, &auth, "purge", None, json!({"itemId": id})).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -462,7 +440,7 @@ pub async fn download_content(
     Path(id): Path<Uuid>,
     Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<Response> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
     // Trashed items stay readable so people can check them before purging; the
     // trash listing is already available to the same `items:read` permission.
     let item = fetch_item(&state, &auth.organization_id, id).await?;
@@ -472,11 +450,11 @@ pub async fn download_content(
     let row = sqlx::query_as::<_, (String, String, Option<String>)>(
         r#"SELECT b.storage_key, b.mime_type, i.original_filename
            FROM vault_items i JOIN vault_blobs b ON b.id = i.blob_id
-           WHERE i.id = $1 AND i.organization_id = $2"#,
+           WHERE i.id = ? AND i.organization_id = ?"#,
     )
-    .bind(id)
+    .bind(id.hyphenated())
     .bind(&auth.organization_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.db.read)
     .await?
     .ok_or(AppError::NotFound)?;
     let path = checked_blob_path(&state, &row.0)?;
@@ -500,15 +478,15 @@ pub async fn preview_content(
     method: Method,
     Path(id): Path<Uuid>,
 ) -> AppResult<Response> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
     let row = sqlx::query_as::<_, (String, String, Option<String>, i64)>(
         r#"SELECT b.storage_key, b.mime_type, i.original_filename, b.size_bytes
            FROM vault_items i JOIN vault_blobs b ON b.id = i.blob_id
-           WHERE i.id=$1 AND i.organization_id=$2"#,
+           WHERE i.id = ? AND i.organization_id = ?"#,
     )
-    .bind(id)
+    .bind(id.hyphenated())
     .bind(&auth.organization_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.db.read)
     .await?
     .ok_or(AppError::NotFound)?;
     let path = checked_blob_path(&state, &row.0)?;
@@ -1089,7 +1067,7 @@ fn checked_blob_path(state: &AppState, storage_key: &str) -> AppResult<std::path
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageCleanupItem {
-    pub id: Uuid,
+    pub id: Id,
     pub filename: String,
     pub size_bytes: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -1115,7 +1093,7 @@ pub async fn storage_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<StorageStatusResponse>> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
     require_workspace_manager(&auth)?;
     Ok(Json(storage_details(&state, &auth).await?))
 }
@@ -1125,21 +1103,22 @@ pub(crate) async fn storage_details(
     auth: &crate::models::AuthContext,
 ) -> AppResult<StorageStatusResponse> {
     let workspace_name =
-        sqlx::query_scalar::<_, String>("SELECT name FROM organization WHERE id=$1")
+        sqlx::query_scalar::<_, String>("SELECT name FROM workspaces WHERE id = ?")
             .bind(&auth.organization_id)
-            .fetch_one(&state.pool)
+            .fetch_one(&state.db.read)
             .await?;
     let workspace_bytes = sqlx::query_scalar::<_, i64>(
-        "SELECT least(coalesce(sum(size_bytes), 0), 9223372036854775807)::bigint FROM vault_blobs WHERE organization_id=$1",
+        "SELECT coalesce(sum(size_bytes), 0) FROM vault_blobs WHERE organization_id = ?",
     )
     .bind(&auth.organization_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.db.read)
     .await?;
     let reserved_upload_bytes = sqlx::query_scalar::<_, i64>(
-        "SELECT least(coalesce(sum(expected_bytes-acknowledged_bytes),0), 9223372036854775807)::bigint FROM vault_upload_sessions WHERE organization_id=$1 AND state='uploading' AND expires_at>now()",
+        "SELECT coalesce(sum(expected_bytes - acknowledged_bytes), 0) FROM vault_upload_sessions WHERE organization_id = ? AND state = 'uploading' AND expires_at > ?",
     )
     .bind(&auth.organization_id)
-    .fetch_one(&state.pool)
+    .bind(db::now())
+    .fetch_one(&state.db.read)
     .await?;
     let items = sqlx::query_as::<_, StorageCleanupItem>(
         r#"SELECT i.id,
@@ -1148,15 +1127,15 @@ pub(crate) async fn storage_details(
                   i.created_at,
                   (i.deleted_at IS NOT NULL) AS deleted,
                   CASE WHEN i.blob_id IS NOT NULL
-                         AND (SELECT count(*) FROM vault_items refs WHERE refs.blob_id=i.blob_id)=1
+                         AND (SELECT count(*) FROM vault_items refs WHERE refs.blob_id = i.blob_id) = 1
                        THEN i.size_bytes ELSE 0 END AS reclaimable_bytes
            FROM vault_items i
-           WHERE i.organization_id=$1 AND i.blob_id IS NOT NULL
+           WHERE i.organization_id = ? AND i.blob_id IS NOT NULL
            ORDER BY (i.deleted_at IS NOT NULL) DESC, i.size_bytes DESC, i.created_at ASC
            LIMIT 250"#,
     )
     .bind(&auth.organization_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.db.read)
     .await?;
     let reclaimable_bytes = items
         .iter()
@@ -1194,7 +1173,7 @@ pub async fn bulk_purge(
     headers: HeaderMap,
     Json(input): Json<BulkPurgeRequest>,
 ) -> AppResult<Json<Value>> {
-    let auth = authorize(&state.auth, &headers, "items:delete").await?;
+    let auth = authorize(&state, &headers, "items:delete").await?;
     require_workspace_manager(&auth)?;
     if auth.api_key_id.is_none() {
         require_same_origin(&state, &headers)?;
@@ -1219,9 +1198,9 @@ pub(crate) async fn purge_items(
         ));
     }
     let workspace_name =
-        sqlx::query_scalar::<_, String>("SELECT name FROM organization WHERE id=$1")
+        sqlx::query_scalar::<_, String>("SELECT name FROM workspaces WHERE id = ?")
             .bind(&auth.organization_id)
-            .fetch_one(&state.pool)
+            .fetch_one(&state.db.read)
             .await?;
     if confirmation.trim() != workspace_name {
         return Err(AppError::Validation(
@@ -1233,14 +1212,13 @@ pub(crate) async fn purge_items(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut tx = state.pool.begin().await?;
-    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
-        r#"SELECT i.id, i.blob_id FROM vault_items i
-           WHERE i.organization_id=$1 AND i.id = ANY($2)
-           FOR UPDATE OF i"#,
+    let mut tx = state.db.begin().await?;
+    let rows = sqlx::query_as::<_, (Id, Option<Id>)>(
+        r#"SELECT id, blob_id FROM vault_items
+           WHERE organization_id = ? AND id IN (SELECT value FROM json_each(?))"#,
     )
     .bind(&auth.organization_id)
-    .bind(&unique)
+    .bind(id_list(&unique))
     .fetch_all(&mut *tx)
     .await?;
     if rows.len() != unique.len() {
@@ -1263,42 +1241,47 @@ pub(crate) async fn purge_items(
     Ok((unique.len(), reclaimed_bytes))
 }
 
+/// A JSON array of IDs, bound once and expanded in SQL with `json_each`.
+pub(crate) fn id_list<T: Serialize>(ids: &[T]) -> String {
+    serde_json::to_string(ids).expect("IDs serialize")
+}
+
 /// Deletes the given item rows and any blob that no longer has a reference.
 ///
 /// Returns the storage keys of removed blobs (to unlink after commit) and the
-/// number of bytes reclaimed. Runs inside the caller's transaction.
+/// number of bytes reclaimed. Runs inside the caller's write transaction.
 async fn delete_items_and_orphans(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    connection: &mut SqliteConnection,
     organization_id: &str,
-    rows: &[(Uuid, Option<Uuid>)],
+    rows: &[(Id, Option<Id>)],
 ) -> AppResult<(Vec<String>, i64)> {
     if rows.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let item_ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
-    let blob_ids: Vec<Uuid> = rows
+    let item_ids: Vec<Id> = rows.iter().map(|(id, _)| *id).collect();
+    let blob_ids: Vec<Id> = rows
         .iter()
         .filter_map(|(_, blob)| *blob)
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    sqlx::query("DELETE FROM vault_items WHERE organization_id=$1 AND id=ANY($2)")
+    sqlx::query("DELETE FROM vault_items WHERE organization_id = ? AND id IN (SELECT value FROM json_each(?))")
         .bind(organization_id)
-        .bind(&item_ids)
-        .execute(&mut **tx)
+        .bind(id_list(&item_ids))
+        .execute(&mut *connection)
         .await?;
     if blob_ids.is_empty() {
         return Ok((Vec::new(), 0));
     }
     let removed = sqlx::query_as::<_, (String, i64)>(
-        r#"DELETE FROM vault_blobs b
-           WHERE b.id = ANY($1) AND b.organization_id = $2
-             AND NOT EXISTS (SELECT 1 FROM vault_items i WHERE i.blob_id = b.id)
-           RETURNING b.storage_key, b.size_bytes"#,
+        r#"DELETE FROM vault_blobs
+           WHERE id IN (SELECT value FROM json_each(?)) AND organization_id = ?
+             AND NOT EXISTS (SELECT 1 FROM vault_items i WHERE i.blob_id = vault_blobs.id)
+           RETURNING storage_key, size_bytes"#,
     )
-    .bind(&blob_ids)
+    .bind(id_list(&blob_ids))
     .bind(organization_id)
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut *connection)
     .await?;
     let reclaimed = removed
         .iter()
@@ -1324,15 +1307,14 @@ async fn purge_trashed(
     auth: &crate::models::AuthContext,
     ids: Option<Vec<Uuid>>,
 ) -> AppResult<(usize, i64)> {
-    let mut tx = state.pool.begin().await?;
-    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
-        r#"SELECT i.id, i.blob_id FROM vault_items i
-           WHERE i.organization_id = $1 AND i.deleted_at IS NOT NULL
-             AND ($2::uuid[] IS NULL OR i.id = ANY($2))
-           FOR UPDATE OF i"#,
+    let mut tx = state.db.begin().await?;
+    let rows = sqlx::query_as::<_, (Id, Option<Id>)>(
+        r#"SELECT id, blob_id FROM vault_items
+           WHERE organization_id = ?1 AND deleted_at IS NOT NULL
+             AND (?2 IS NULL OR id IN (SELECT value FROM json_each(?2)))"#,
     )
     .bind(&auth.organization_id)
-    .bind(ids)
+    .bind(ids.as_deref().map(id_list))
     .fetch_all(&mut *tx)
     .await?;
     let (keys, reclaimed) = delete_items_and_orphans(&mut tx, &auth.organization_id, &rows).await?;
@@ -1354,7 +1336,7 @@ pub async fn bulk_items(
     headers: HeaderMap,
     Json(input): Json<BulkItemsRequest>,
 ) -> AppResult<Json<Value>> {
-    let auth = authorize(&state.auth, &headers, "items:delete").await?;
+    let auth = authorize(&state, &headers, "items:delete").await?;
     if auth.api_key_id.is_none() {
         require_same_origin(&state, &headers)?;
     }
@@ -1371,23 +1353,26 @@ pub async fn bulk_items(
     }
     let (affected, reclaimed) = match input.action.as_str() {
         "trash" => {
+            let now = db::now();
             let changed = sqlx::query(
-                "UPDATE vault_items SET deleted_at = now(), updated_at = now() WHERE organization_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+                "UPDATE vault_items SET deleted_at = ?1, updated_at = ?1 WHERE organization_id = ?2 AND id IN (SELECT value FROM json_each(?3)) AND deleted_at IS NULL",
             )
+            .bind(&now)
             .bind(&auth.organization_id)
-            .bind(&ids)
-            .execute(&state.pool)
+            .bind(id_list(&ids))
+            .execute(&state.db.write)
             .await?
             .rows_affected();
             (changed as usize, 0)
         }
         "restore" => {
             let changed = sqlx::query(
-                "UPDATE vault_items SET deleted_at = NULL, updated_at = now() WHERE organization_id = $1 AND id = ANY($2) AND deleted_at IS NOT NULL",
+                "UPDATE vault_items SET deleted_at = NULL, updated_at = ?1 WHERE organization_id = ?2 AND id IN (SELECT value FROM json_each(?3)) AND deleted_at IS NOT NULL",
             )
+            .bind(db::now())
             .bind(&auth.organization_id)
-            .bind(&ids)
-            .execute(&state.pool)
+            .bind(id_list(&ids))
+            .execute(&state.db.write)
             .await?
             .rows_affected();
             (changed as usize, 0)
@@ -1419,7 +1404,7 @@ pub async fn empty_trash(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let auth = authorize(&state.auth, &headers, "items:delete").await?;
+    let auth = authorize(&state, &headers, "items:delete").await?;
     if auth.api_key_id.is_none() {
         require_same_origin(&state, &headers)?;
     }
@@ -1461,9 +1446,9 @@ pub async fn export_items(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<Response> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
-    let items = sqlx::query_as::<_, ItemRow>("SELECT * FROM vault_items WHERE organization_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC")
-        .bind(&auth.organization_id).fetch_all(&state.pool).await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
+    let items = sqlx::query_as::<_, ItemRow>("SELECT * FROM vault_items WHERE organization_id = ? AND deleted_at IS NULL ORDER BY created_at DESC")
+        .bind(&auth.organization_id).fetch_all(&state.db.read).await?;
     if query.get("format").map(String::as_str) == Some("csv") {
         let mut writer = csv::Writer::from_writer(Vec::new());
         writer
@@ -1516,18 +1501,24 @@ pub async fn list_tags(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let auth = authorize(&state.auth, &headers, "items:read").await?;
+    let auth = authorize(&state, &headers, "items:read").await?;
     let tags = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT jsonb_array_elements_text(tags) FROM vault_items WHERE organization_id = $1 AND deleted_at IS NULL ORDER BY 1",
-    ).bind(&auth.organization_id).fetch_all(&state.pool).await?;
+        r#"SELECT DISTINCT tag.value FROM vault_items, json_each(vault_items.tags) AS tag
+           WHERE vault_items.organization_id = ? AND vault_items.deleted_at IS NULL
+             AND tag.type = 'text'
+           ORDER BY 1"#,
+    )
+    .bind(&auth.organization_id)
+    .fetch_all(&state.db.read)
+    .await?;
     Ok(Json(json!({"tags": tags})))
 }
 
 async fn fetch_item(state: &AppState, organization_id: &str, id: Uuid) -> AppResult<ItemRow> {
-    sqlx::query_as::<_, ItemRow>("SELECT * FROM vault_items WHERE id = $1 AND organization_id = $2")
-        .bind(id)
+    sqlx::query_as::<_, ItemRow>("SELECT * FROM vault_items WHERE id = ? AND organization_id = ?")
+        .bind(id.hyphenated())
         .bind(organization_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.db.read)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -1536,11 +1527,11 @@ async fn fetch_item(state: &AppState, organization_id: &str, id: Uuid) -> AppRes
 /// default chosen by an administrator, always capped by `SERVER_MAX_UPLOAD_BYTES`.
 pub(crate) async fn workspace_limit(state: &AppState, organization_id: &str) -> AppResult<u64> {
     let configured = sqlx::query_scalar::<_, i64>(
-        "SELECT coalesce((SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id = $1), (SELECT default_max_upload_bytes FROM vault_server_settings WHERE id), $2)::bigint",
+        "SELECT coalesce((SELECT max_upload_bytes FROM vault_workspace_settings WHERE organization_id = ?1), (SELECT default_max_upload_bytes FROM server_settings WHERE id = 1), ?2)",
     )
     .bind(organization_id)
     .bind(state.server_max_upload_bytes.min(i64::MAX as u64) as i64)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.db.read)
     .await?;
     Ok((configured.max(1) as u64).min(state.server_max_upload_bytes))
 }
@@ -1565,16 +1556,16 @@ fn validate_source_url(value: Option<String>) -> AppResult<Option<String>> {
     Ok(Some(value))
 }
 
-async fn audit(
+pub(crate) async fn audit(
     state: &AppState,
     auth: &crate::models::AuthContext,
     action: &str,
-    item_id: Option<Uuid>,
+    item_id: Option<Id>,
     detail: Value,
 ) {
     let result = sqlx::query(
-        "INSERT INTO vault_activity (organization_id, actor_user_id, actor_key_id, action, item_id, detail) VALUES ($1,$2,$3,$4,$5,$6)",
-    ).bind(&auth.organization_id).bind(&auth.user_id).bind(&auth.api_key_id).bind(action).bind(item_id).bind(detail).execute(&state.pool).await;
+        "INSERT INTO vault_activity (organization_id, actor_user_id, actor_key_id, action, item_id, detail, created_at) VALUES (?,?,?,?,?,?,?)",
+    ).bind(&auth.organization_id).bind(&auth.user_id).bind(&auth.api_key_id).bind(action).bind(item_id).bind(detail).bind(db::now()).execute(&state.db.write).await;
     if let Err(error) = result {
         tracing::warn!(%error, "failed to record activity");
     }
@@ -1582,7 +1573,7 @@ async fn audit(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_preview, media_signature, search_tsquery};
+    use super::{classify_preview, media_signature, search_query};
 
     #[test]
     fn audio_and_video_are_recognised_by_their_bytes() {
@@ -1630,53 +1621,53 @@ mod tests {
     }
 
     #[test]
-    fn a_single_word_becomes_a_prefix_lexeme() {
-        assert_eq!(search_tsquery("deploy").as_deref(), Some("deploy:*"));
+    fn a_single_word_becomes_a_prefix_term() {
+        assert_eq!(search_query("deploy").as_deref(), Some("\"deploy\"*"));
     }
 
     #[test]
     fn every_word_must_match() {
         assert_eq!(
-            search_tsquery("deploy logs").as_deref(),
-            Some("deploy:* & logs:*")
+            search_query("deploy logs").as_deref(),
+            Some("\"deploy\"* AND \"logs\"*")
         );
     }
 
     #[test]
-    fn punctuation_splits_instead_of_reaching_tsquery_syntax() {
-        // A raw ':' or '&' would make to_tsquery reject the whole statement.
+    fn punctuation_splits_instead_of_reaching_fts_syntax() {
+        // A raw quote, '*', ':' or '-' would change the meaning of an FTS5 query.
         assert_eq!(
-            search_tsquery("user@example.com").as_deref(),
-            Some("user:* & example:* & com:*")
+            search_query("user@example.com").as_deref(),
+            Some("\"user\"* AND \"example\"* AND \"com\"*")
         );
         assert_eq!(
-            search_tsquery("a & b | c:*").as_deref(),
-            Some("a:* & b:* & c:*")
+            search_query("a \" b* | -c:x NEAR(").as_deref(),
+            Some("\"a\"* AND \"b\"* AND \"c\"* AND \"x\"* AND \"near\"*")
         );
     }
 
     #[test]
     fn searching_is_case_insensitive() {
-        assert_eq!(search_tsquery("Deploy").as_deref(), Some("deploy:*"));
+        assert_eq!(search_query("Deploy").as_deref(), Some("\"deploy\"*"));
     }
 
     #[test]
     fn blank_and_symbol_only_input_produces_no_clause() {
-        assert!(search_tsquery("").is_none());
-        assert!(search_tsquery("   ").is_none());
-        assert!(search_tsquery("!!! ???").is_none());
+        assert!(search_query("").is_none());
+        assert!(search_query("   ").is_none());
+        assert!(search_query("!!! ???").is_none());
     }
 
     #[test]
     fn long_input_is_bounded() {
-        let many = search_tsquery("a b c d e f g h i j k l").unwrap();
-        assert_eq!(many.matches(" & ").count(), 7);
-        let long = search_tsquery(&"z".repeat(200)).unwrap();
-        assert_eq!(long.len(), 50);
+        let many = search_query("a b c d e f g h i j k l").unwrap();
+        assert_eq!(many.matches(" AND ").count(), 7);
+        let long = search_query(&"z".repeat(200)).unwrap();
+        assert_eq!(long.len(), 48 + 3);
     }
 
     #[test]
     fn non_ascii_words_survive() {
-        assert_eq!(search_tsquery("ანგარიში").as_deref(), Some("ანგარიში:*"));
+        assert_eq!(search_query("ანგარიში").as_deref(), Some("\"ანგარიში\"*"));
     }
 }

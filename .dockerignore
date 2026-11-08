@@ -31,3 +31,5 @@ Dockerfile*
 docker-compose*.yml
 *.log
 __pycache__
+migrations-postgres
+docs

@@ -1,14 +1,19 @@
 pub mod api;
 pub mod auth;
+pub mod backup;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod filters;
+pub mod identity;
+pub mod import;
 pub mod models;
 pub mod pages;
 pub mod storage;
 pub mod uploads;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -18,10 +23,9 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderName, Request},
     middleware,
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -29,34 +33,65 @@ use tower_http::{
     services::ServeDir,
     trace::TraceLayer,
 };
+use uuid::Uuid;
 
-use crate::{auth::AuthBridge, config::Config};
+use crate::{
+    config::Config,
+    db::Db,
+    identity::{oauth, rate_limit::RateLimiter},
+};
+
+/// Sign-in, sign-up and the other auth bodies are small JSON documents.
+const AUTH_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
-    pub auth: AuthBridge,
+    pub db: Db,
+    pub data_dir: Arc<PathBuf>,
     pub upload_root: Arc<PathBuf>,
     pub public_base_url: Arc<String>,
+    pub secure_cookies: bool,
+    pub vault_secret: Arc<String>,
+    pub setup_token: Arc<String>,
+    pub trust_proxy_headers: bool,
+    pub backup_keep: usize,
     pub server_max_upload_bytes: u64,
     pub legacy_max_upload_bytes: u64,
     pub upload_disk_reserve_bytes: u64,
     pub tus_chunk_size_bytes: u64,
     pub tus_session_ttl_seconds: u64,
+    pub limiter: Arc<RateLimiter>,
+    pub oauth: Arc<oauth::Registry>,
+    pub http: reqwest::Client,
+    /// Serializes upload admission (disk-reserve checks) across Tus creates and
+    /// multipart uploads. Held in process, never across a database transaction.
+    pub upload_admission: Arc<tokio::sync::Mutex<()>>,
+    /// One lock per active Tus upload so its PATCH requests apply in order.
+    pub upload_locks: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AppState {
-    pub fn new(config: &Config, pool: PgPool) -> Self {
+    pub fn new(config: &Config, db: Db, oauth: oauth::Registry) -> Self {
         Self {
-            pool,
-            auth: AuthBridge::new(&config.auth_internal_url, &config.auth_bridge_secret),
+            db,
+            data_dir: Arc::new(config.data_dir.clone()),
             upload_root: Arc::new(config.upload_root.clone()),
             public_base_url: Arc::new(config.public_base_url.clone()),
+            secure_cookies: config.secure_cookies(),
+            vault_secret: Arc::new(config.vault_secret.clone()),
+            setup_token: Arc::new(config.setup_token.clone()),
+            trust_proxy_headers: config.trust_proxy_headers,
+            backup_keep: config.backup_keep,
             server_max_upload_bytes: config.server_max_upload_bytes,
             legacy_max_upload_bytes: config.legacy_max_upload_bytes,
             upload_disk_reserve_bytes: config.upload_disk_reserve_bytes,
             tus_chunk_size_bytes: config.tus_chunk_size_bytes,
             tus_session_ttl_seconds: config.tus_session_ttl_seconds,
+            limiter: Arc::new(RateLimiter::default()),
+            oauth: Arc::new(oauth),
+            http: oauth::http_client(),
+            upload_admission: Arc::new(tokio::sync::Mutex::new(())),
+            upload_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -151,6 +186,7 @@ pub fn build_router(state: AppState) -> Router {
             post(pages::admin_revoke_sessions),
         )
         .route("/admin/users/{id}/delete", post(pages::admin_delete_user))
+        .route("/admin/backup", get(pages::download_backup))
         .route("/api/v1/items", get(api::list_items).post(api::create_item))
         .route(
             "/api/v1/items/{id}",
@@ -186,11 +222,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/storage/purge", post(api::bulk_purge))
         .route("/api/v1/items/export", get(api::export_items))
         .route("/api/v1/tags", get(api::list_tags))
+        .merge(auth_routes())
         .route("/health/live", get(api::live))
         .route("/health/ready", get(api::ready))
         .nest_service("/static", ServeDir::new("static"))
         .fallback(pages::not_found)
         .layer(DefaultBodyLimit::max(max_body))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            identity::refresh_session,
+        ))
         .layer(middleware::from_fn(security_headers))
         .layer(CompressionLayer::new())
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
@@ -198,6 +239,23 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+/// Native authentication routes, at the paths and with the JSON shapes that
+/// `static/app.js` used with Better Auth.
+fn auth_routes() -> Router<AppState> {
+    use identity::routes;
+    Router::new()
+        .route("/api/auth/sign-in/email", post(routes::sign_in_email))
+        .route("/api/auth/sign-up/email", post(routes::sign_up_email))
+        .route("/api/auth/sign-out", post(routes::sign_out))
+        .route("/api/auth/reset-password", post(routes::reset_password))
+        .route("/api/auth/vault/bootstrap", post(routes::bootstrap))
+        .route("/api/auth/vault/providers", get(routes::providers))
+        .route("/api/auth/sign-in/social", post(routes::sign_in_social))
+        .route("/api/auth/callback/{provider}", get(routes::oauth_callback))
+        .route("/api/auth/{*rest}", any(routes::not_found))
+        .layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT))
 }
 
 async fn security_headers(

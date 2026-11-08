@@ -20,7 +20,7 @@ server {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     location /api/auth/ {
         limit_req zone=auth_limit burst=20 nodelay;
-        proxy_pass http://auth:3001;
+        proxy_pass http://vault:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

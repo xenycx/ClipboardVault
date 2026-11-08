@@ -2,15 +2,34 @@ use std::{env, path::PathBuf};
 
 use anyhow::{Context, bail};
 
+/// Environment variables that 2.x needed and 3.0 no longer reads. Starting with one
+/// of them set is allowed, but it is logged so a half-migrated `.env` is noticed.
+pub const RETIRED_VARIABLES: [&str; 7] = [
+    "DATABASE_URL",
+    "BETTER_AUTH_SECRET",
+    "BETTER_AUTH_URL",
+    "AUTH_BRIDGE_SECRET",
+    "AUTH_INTERNAL_URL",
+    "AUTH_PROXY_ENABLED",
+    "BOOTSTRAP_TOKEN",
+];
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
-    pub database_url: String,
-    pub database_max_connections: u32,
+    /// Holds `vault.db`, `uploads/` and `backups/`.
+    pub data_dir: PathBuf,
     pub upload_root: PathBuf,
     pub public_base_url: String,
-    pub auth_internal_url: String,
-    pub auth_bridge_secret: String,
+    /// Signs short-lived browser state such as the social sign-in cookie.
+    pub vault_secret: String,
+    /// Claims the first administrator account on `/setup`.
+    pub setup_token: String,
+    /// Read the client address from `X-Forwarded-For`. Only enable behind a proxy
+    /// that overwrites or appends that header; otherwise clients can spoof it.
+    pub trust_proxy_headers: bool,
+    pub database_read_connections: u32,
+    pub backup_keep: usize,
     pub server_max_upload_bytes: u64,
     pub legacy_max_upload_bytes: u64,
     pub upload_disk_reserve_bytes: u64,
@@ -20,55 +39,95 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let auth_bridge_secret = required("AUTH_BRIDGE_SECRET")?;
-        if auth_bridge_secret.len() < 32 {
-            bail!("AUTH_BRIDGE_SECRET must contain at least 32 characters");
+        let vault_secret = required("VAULT_SECRET")?;
+        if vault_secret.len() < 32 {
+            bail!("VAULT_SECRET must contain at least 32 characters");
         }
+        let setup_token = required("SETUP_TOKEN")?;
+        if setup_token.len() < 32 {
+            bail!("SETUP_TOKEN must contain at least 32 characters");
+        }
+        let data_dir: PathBuf = env::var("DATA_DIR")
+            .unwrap_or_else(|_| "/data".into())
+            .into();
+        let upload_root = env::var("UPLOAD_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir.join("uploads"));
         let config = Self {
             port: parse("PORT", 8080)?,
-            database_url: required("DATABASE_URL")?,
-            database_max_connections: parse("DATABASE_MAX_CONNECTIONS", 20)?,
-            upload_root: env::var("UPLOAD_ROOT")
-                .unwrap_or_else(|_| "/data/uploads".into())
-                .into(),
+            data_dir,
+            upload_root,
             public_base_url: env::var("PUBLIC_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".into())
                 .trim_end_matches('/')
                 .to_owned(),
-            auth_internal_url: env::var("AUTH_INTERNAL_URL")
-                .unwrap_or_else(|_| "http://auth:3001".into())
-                .trim_end_matches('/')
-                .to_owned(),
-            auth_bridge_secret,
+            vault_secret,
+            setup_token,
+            trust_proxy_headers: flag("TRUST_PROXY_HEADERS")?,
+            database_read_connections: parse("DATABASE_READ_CONNECTIONS", 8)?,
+            backup_keep: parse("BACKUP_KEEP", 7)?,
             server_max_upload_bytes: parse("SERVER_MAX_UPLOAD_BYTES", 10_737_418_240)?,
             legacy_max_upload_bytes: parse("LEGACY_MAX_UPLOAD_BYTES", 104_857_600)?,
             upload_disk_reserve_bytes: parse("UPLOAD_DISK_RESERVE_BYTES", 21_474_836_480)?,
             tus_chunk_size_bytes: parse("TUS_CHUNK_SIZE_BYTES", 16_777_216)?,
             tus_session_ttl_seconds: parse("TUS_SESSION_TTL_SECONDS", 604_800)?,
         };
-        if config.server_max_upload_bytes == 0 || config.server_max_upload_bytes > i64::MAX as u64 {
+        url::Url::parse(&config.public_base_url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+            .context("PUBLIC_BASE_URL must be an absolute http(s) URL")?;
+        config.validate_limits()?;
+        Ok(config)
+    }
+
+    pub fn validate_limits(&self) -> anyhow::Result<()> {
+        if self.server_max_upload_bytes == 0 || self.server_max_upload_bytes > i64::MAX as u64 {
             bail!("SERVER_MAX_UPLOAD_BYTES must be between 1 and {}", i64::MAX);
         }
-        if config.legacy_max_upload_bytes == 0
-            || config.legacy_max_upload_bytes > config.server_max_upload_bytes
-            || config.legacy_max_upload_bytes.saturating_add(1024 * 1024) > usize::MAX as u64
+        if self.legacy_max_upload_bytes == 0
+            || self.legacy_max_upload_bytes > self.server_max_upload_bytes
+            || self.legacy_max_upload_bytes.saturating_add(1024 * 1024) > usize::MAX as u64
         {
             bail!(
                 "LEGACY_MAX_UPLOAD_BYTES must fit the request platform and not exceed the server maximum"
             );
         }
-        if config.tus_chunk_size_bytes == 0
-            || config.tus_chunk_size_bytes > config.legacy_max_upload_bytes
-            || config.tus_chunk_size_bytes > usize::MAX as u64
+        if self.tus_chunk_size_bytes == 0
+            || self.tus_chunk_size_bytes > self.legacy_max_upload_bytes
+            || self.tus_chunk_size_bytes > usize::MAX as u64
         {
             bail!(
                 "TUS_CHUNK_SIZE_BYTES must be positive, fit memory, and not exceed the legacy request limit"
             );
         }
-        if config.tus_session_ttl_seconds == 0 || config.tus_session_ttl_seconds > i64::MAX as u64 {
+        if self.tus_session_ttl_seconds == 0 || self.tus_session_ttl_seconds > i64::MAX as u64 {
             bail!("TUS_SESSION_TTL_SECONDS is outside the supported range");
         }
-        Ok(config)
+        Ok(())
+    }
+
+    pub fn secure_cookies(&self) -> bool {
+        self.public_base_url.starts_with("https://")
+    }
+
+    /// Retired 2.x variables that are still set, for a startup warning.
+    pub fn retired_variables_present() -> Vec<&'static str> {
+        RETIRED_VARIABLES
+            .into_iter()
+            .filter(|name| env::var_os(name).is_some())
+            .collect()
+    }
+}
+
+pub(crate) fn flag(name: &str) -> anyhow::Result<bool> {
+    parse_flag(name, &env::var(name).unwrap_or_default())
+}
+
+fn parse_flag(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        other => bail!("{name} must be true or false, not {other:?}"),
     }
 }
 
@@ -85,4 +144,17 @@ where
         .unwrap_or_else(|_| default.to_string())
         .parse()
         .with_context(|| format!("invalid {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_flag;
+
+    #[test]
+    fn proxy_trust_defaults_to_off() {
+        assert!(!parse_flag("TRUST_PROXY_HEADERS", "").unwrap());
+        assert!(!parse_flag("TRUST_PROXY_HEADERS", "false").unwrap());
+        assert!(parse_flag("TRUST_PROXY_HEADERS", "true").unwrap());
+        assert!(parse_flag("TRUST_PROXY_HEADERS", "maybe").is_err());
+    }
 }

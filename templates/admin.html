@@ -31,7 +31,7 @@
         <label class="toggle"><span><strong>Approve new accounts</strong><small>New accounts wait here for approval. When off, they open their workspace right away.</small></span><input type="checkbox" name="require_approval" class="switch" {% if settings.require_approval %}checked{% endif %}></label>
       </fieldset>
       <label class="field"><span>Default upload limit per file (MB)</span><input type="number" name="default_max_upload_mb" min="1" max="{{ server_max_upload_mb }}" value="{{ default_upload_mb }}" required inputmode="numeric"><small>Used by workspaces that have not set their own. Server maximum: {{ server_max_upload_mb }} MB.</small></label>
-      <div class="panel-actions"><button class="button primary" type="submit"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span>Save settings</span></button></div>
+      <div class="panel-actions"><button class="button primary" type="submit"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span>Save settings</span></button><a class="button" href="/admin/backup" download title="A consistent copy of the database. Uploaded files are not included."><svg class="i" aria-hidden="true"><use href="#i-database"/></svg><span>Download database snapshot</span></a></div>
     </form>
   </section>
 

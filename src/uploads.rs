@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::authorize,
+    db::{self, Id},
     error::{AppError, AppResult},
     models::ItemRow,
     storage::{
@@ -30,7 +31,7 @@ const TUS_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Clone, FromRow)]
 struct UploadSession {
-    id: Uuid,
+    id: Id,
     organization_id: String,
     created_by_user_id: Option<String>,
     created_by_key_id: Option<String>,
@@ -43,7 +44,7 @@ struct UploadSession {
     declared_mime: Option<String>,
     expected_bytes: i64,
     acknowledged_bytes: i64,
-    item_id: Option<Uuid>,
+    item_id: Option<Id>,
     error_code: Option<String>,
     expires_at: DateTime<Utc>,
 }
@@ -51,11 +52,11 @@ struct UploadSession {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadStatus {
-    id: Uuid,
+    id: Id,
     state: String,
     upload_offset: i64,
     upload_length: i64,
-    item_id: Option<Uuid>,
+    item_id: Option<Id>,
     error: Option<String>,
     expires_at: DateTime<Utc>,
 }
@@ -98,7 +99,7 @@ pub async fn create_upload(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     require_tus(&headers)?;
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     let length = required_u64_header(&headers, "upload-length")?;
     if length == 0 {
         return Err(AppError::Validation(
@@ -152,17 +153,9 @@ pub async fn create_upload(
         .filter(|value| value.len() <= 255 && !value.contains(['\r', '\n']))
         .cloned();
 
-    let mut tx = state.pool.begin().await?;
     // Serialize capacity admission so simultaneous creates cannot over-reserve disk.
-    sqlx::query("SELECT pg_advisory_xact_lock(192837465)")
-        .execute(&mut *tx)
-        .await?;
-    let outstanding = sqlx::query_scalar::<_, i64>(
-        "SELECT least(coalesce(sum(expected_bytes - acknowledged_bytes), 0), 9223372036854775807)::bigint FROM vault_upload_sessions WHERE state = 'uploading' AND expires_at > now()",
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .max(0) as u64;
+    let admission = state.upload_admission.lock().await;
+    let outstanding = outstanding_reservations(&state).await?;
     let available = available_space(&state.upload_root)?;
     let required = state
         .upload_disk_reserve_bytes
@@ -179,14 +172,17 @@ pub async fn create_upload(
     let temp_storage_key = format!("tmp/{id}.part");
     let expires_at = Utc::now()
         + chrono::Duration::seconds(state.tus_session_ttl_seconds.min(i64::MAX as u64) as i64);
-    sqlx::query(
+    let temp_path = state.upload_root.join(&temp_storage_key);
+    tokio::fs::File::create(&temp_path).await?;
+    let now = db::now();
+    let inserted = sqlx::query(
         r#"INSERT INTO vault_upload_sessions
            (id, organization_id, created_by_user_id, created_by_key_id, temp_storage_key,
             original_filename, virtual_path, source_url, tags, declared_mime, expected_bytes,
-            expires_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"#,
+            expires_at, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
     )
-    .bind(id)
+    .bind(id.hyphenated())
     .bind(&auth.organization_id)
     .bind(&auth.user_id)
     .bind(&auth.api_key_id)
@@ -197,15 +193,16 @@ pub async fn create_upload(
     .bind(json!(tags))
     .bind(&declared_mime)
     .bind(length as i64)
-    .bind(expires_at)
-    .execute(&mut *tx)
-    .await?;
-    let temp_path = state.upload_root.join(&temp_storage_key);
-    if let Err(error) = tokio::fs::File::create(&temp_path).await {
-        tx.rollback().await?;
+    .bind(db::ts(expires_at))
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db.write)
+    .await;
+    drop(admission);
+    if let Err(error) = inserted {
+        let _ = tokio::fs::remove_file(&temp_path).await;
         return Err(error.into());
     }
-    tx.commit().await?;
 
     let location = format!("{}/api/v1/uploads/{id}", state.public_base_url);
     let mut response = StatusCode::CREATED.into_response();
@@ -224,7 +221,7 @@ pub async fn head_upload(
     AxumPath(id): AxumPath<Uuid>,
 ) -> AppResult<Response> {
     require_tus(&headers)?;
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     let row = fetch_session(&state, id, &auth.organization_id).await?;
     if matches!(row.state.as_str(), "failed" | "canceled" | "expired") {
         let mut response = StatusCode::GONE.into_response();
@@ -254,7 +251,7 @@ pub async fn patch_upload(
     body: Bytes,
 ) -> AppResult<Response> {
     require_tus(&headers)?;
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -278,15 +275,30 @@ pub async fn patch_upload(
         });
     }
 
-    let mut tx = state.pool.begin().await?;
-    let row = sqlx::query_as::<_, UploadSession>(
-        "SELECT * FROM vault_upload_sessions WHERE id = $1 AND organization_id = $2 FOR UPDATE",
-    )
-    .bind(id)
-    .bind(&auth.organization_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(AppError::NotFound)?;
+    // One PATCH at a time per upload. The lock is in-process, so the chunk is
+    // written to disk without holding the database write connection.
+    let lock = upload_lock(&state, id);
+    let guard = lock.lock().await;
+    let result = write_chunk(&state, &auth.organization_id, id, offset, &body).await;
+    drop(guard);
+    release_upload_lock(&state, id, lock);
+    let (next_offset, expected, expires_at) = result?;
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    add_tus_headers(&mut response, next_offset, expected, Some(expires_at));
+    Ok(response)
+}
+
+/// Appends one chunk at the server's confirmed offset and records the new offset.
+/// Returns `(new offset, expected length, new expiry)`.
+async fn write_chunk(
+    state: &AppState,
+    organization_id: &str,
+    id: Uuid,
+    offset: u64,
+    body: &[u8],
+) -> AppResult<(u64, u64, DateTime<Utc>)> {
+    let row = fetch_session(state, id, organization_id).await?;
     if row.state != "uploading" || row.expires_at <= Utc::now() {
         return Err(AppError::Validation("upload is not active".into()));
     }
@@ -296,19 +308,15 @@ pub async fn patch_upload(
             expected: server_offset,
         });
     }
+    let expected = row.expected_bytes.max(0) as u64;
     let next_offset = offset.saturating_add(body.len() as u64);
-    if next_offset > row.expected_bytes as u64 {
+    if next_offset > expected {
         return Err(AppError::PayloadTooLarge {
             received: next_offset,
-            limit: row.expected_bytes as u64,
+            limit: expected,
         });
     }
-    let outstanding = sqlx::query_scalar::<_, i64>(
-        "SELECT least(coalesce(sum(expected_bytes - acknowledged_bytes), 0), 9223372036854775807)::bigint FROM vault_upload_sessions WHERE state = 'uploading' AND expires_at > now()",
-    )
-    .fetch_one(&mut *tx)
-    .await?
-    .max(0) as u64;
+    let outstanding = outstanding_reservations(state).await?;
     let available = available_space(&state.upload_root)?;
     let required = state.upload_disk_reserve_bytes.saturating_add(outstanding);
     if available < required {
@@ -318,7 +326,7 @@ pub async fn patch_upload(
         });
     }
 
-    let path = safe_storage_path(&state, &row.temp_storage_key)?;
+    let path = safe_storage_path(state, &row.temp_storage_key)?;
     let mut file = tokio::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -326,9 +334,11 @@ pub async fn patch_upload(
         .await?;
     let actual_length = file.metadata().await?.len();
     if actual_length < server_offset {
-        sqlx::query("UPDATE vault_upload_sessions SET state='failed', error_code='PARTIAL_FILE_SHORT', updated_at=now() WHERE id=$1")
-            .bind(id).execute(&mut *tx).await?;
-        tx.commit().await?;
+        sqlx::query("UPDATE vault_upload_sessions SET state = 'failed', error_code = 'PARTIAL_FILE_SHORT', updated_at = ? WHERE id = ?")
+            .bind(db::now())
+            .bind(id.hyphenated())
+            .execute(&state.db.write)
+            .await?;
         return Err(AppError::Validation(
             "partial upload is shorter than its confirmed offset".into(),
         ));
@@ -337,34 +347,70 @@ pub async fn patch_upload(
         file.set_len(server_offset).await?;
     }
     file.seek(std::io::SeekFrom::Start(server_offset)).await?;
-    file.write_all(&body).await?;
+    file.write_all(body).await?;
     file.sync_data().await?;
-    let state_value = if next_offset == row.expected_bytes as u64 {
+    drop(file);
+    let state_value = if next_offset == expected {
         "finalizing"
     } else {
         "uploading"
     };
     let expires_at = Utc::now()
         + chrono::Duration::seconds(state.tus_session_ttl_seconds.min(i64::MAX as u64) as i64);
-    sqlx::query(
-        "UPDATE vault_upload_sessions SET acknowledged_bytes=$2, state=$3, expires_at=$4, updated_at=now() WHERE id=$1",
+    // Conditional on the offset this request started from: if anything moved the
+    // session meanwhile (a cancel, an expiry), the bytes are not acknowledged.
+    let updated = sqlx::query(
+        r#"UPDATE vault_upload_sessions
+           SET acknowledged_bytes = ?, state = ?, expires_at = ?, updated_at = ?
+           WHERE id = ? AND state = 'uploading' AND acknowledged_bytes = ?"#,
     )
-    .bind(id)
     .bind(next_offset as i64)
     .bind(state_value)
-    .bind(expires_at)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
+    .bind(db::ts(expires_at))
+    .bind(db::now())
+    .bind(id.hyphenated())
+    .bind(server_offset as i64)
+    .execute(&state.db.write)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Err(AppError::Validation("upload is not active".into()));
+    }
+    Ok((next_offset, expected, expires_at))
+}
 
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    add_tus_headers(
-        &mut response,
-        next_offset,
-        row.expected_bytes as u64,
-        Some(expires_at),
-    );
-    Ok(response)
+fn upload_lock(state: &AppState, id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut locks = state
+        .upload_locks
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    locks.entry(id).or_default().clone()
+}
+
+/// Drops the per-upload lock entry once no other request is waiting on it.
+fn release_upload_lock(state: &AppState, id: Uuid, lock: std::sync::Arc<tokio::sync::Mutex<()>>) {
+    let mut locks = state
+        .upload_locks
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drop(lock);
+    if locks
+        .get(&id)
+        .is_some_and(|entry| std::sync::Arc::strong_count(entry) == 1)
+    {
+        locks.remove(&id);
+    }
+}
+
+/// Bytes promised to active Tus uploads but not yet received.
+pub(crate) async fn outstanding_reservations(state: &AppState) -> AppResult<u64> {
+    let outstanding = sqlx::query_scalar::<_, i64>(
+        "SELECT coalesce(sum(expected_bytes - acknowledged_bytes), 0) FROM vault_upload_sessions WHERE state = 'uploading' AND expires_at > ?",
+    )
+    .bind(db::now())
+    .fetch_one(&state.db.read)
+    .await?;
+    Ok(outstanding.max(0) as u64)
 }
 
 pub async fn cancel_upload(
@@ -373,15 +419,16 @@ pub async fn cancel_upload(
     AxumPath(id): AxumPath<Uuid>,
 ) -> AppResult<Response> {
     require_tus(&headers)?;
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     let key = sqlx::query_scalar::<_, String>(
-        r#"UPDATE vault_upload_sessions SET state='canceled', updated_at=now()
-           WHERE id=$1 AND organization_id=$2 AND state IN ('uploading','failed')
+        r#"UPDATE vault_upload_sessions SET state = 'canceled', updated_at = ?
+           WHERE id = ? AND organization_id = ? AND state IN ('uploading', 'failed')
            RETURNING temp_storage_key"#,
     )
-    .bind(id)
+    .bind(db::now())
+    .bind(id.hyphenated())
     .bind(&auth.organization_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.db.write)
     .await?
     .ok_or(AppError::NotFound)?;
     if let Ok(path) = safe_storage_path(&state, &key) {
@@ -399,7 +446,7 @@ pub async fn upload_status(
     headers: HeaderMap,
     AxumPath(id): AxumPath<Uuid>,
 ) -> AppResult<Json<Value>> {
-    let auth = authorize(&state.auth, &headers, "items:write").await?;
+    let auth = authorize(&state, &headers, "items:write").await?;
     let row = fetch_session(&state, id, &auth.organization_id).await?;
     Ok(Json(serde_json::to_value(UploadStatus::from(row)).unwrap()))
 }
@@ -413,13 +460,15 @@ pub async fn maintenance_worker(state: AppState) {
     }
 }
 
-async fn maintenance_tick(state: &AppState) -> AppResult<()> {
-    let expired = sqlx::query_as::<_, (Uuid, String)>(
-        r#"UPDATE vault_upload_sessions SET state='expired', updated_at=now()
-           WHERE state='uploading' AND expires_at <= now()
+pub async fn maintenance_tick(state: &AppState) -> AppResult<()> {
+    let now = Utc::now();
+    let expired = sqlx::query_as::<_, (Id, String)>(
+        r#"UPDATE vault_upload_sessions SET state = 'expired', updated_at = ?1
+           WHERE state = 'uploading' AND expires_at <= ?1
            RETURNING id, temp_storage_key"#,
     )
-    .fetch_all(&state.pool)
+    .bind(db::ts(now))
+    .fetch_all(&state.db.write)
     .await?;
     for (_, key) in expired {
         if let Ok(path) = safe_storage_path(state, &key) {
@@ -427,12 +476,13 @@ async fn maintenance_tick(state: &AppState) -> AppResult<()> {
         }
     }
 
-    let stale = sqlx::query_as::<_, (Uuid, String)>(
+    let stale = sqlx::query_as::<_, (Id, String)>(
         r#"DELETE FROM vault_upload_sessions
-           WHERE state IN ('failed','canceled','expired','completed') AND expires_at <= now()
+           WHERE state IN ('failed', 'canceled', 'expired', 'completed') AND expires_at <= ?
            RETURNING id, temp_storage_key"#,
     )
-    .fetch_all(&state.pool)
+    .bind(db::ts(now))
+    .fetch_all(&state.db.write)
     .await?;
     for (_, key) in stale {
         if let Ok(path) = safe_storage_path(state, &key) {
@@ -440,43 +490,36 @@ async fn maintenance_tick(state: &AppState) -> AppResult<()> {
         }
     }
 
+    // Claim one finished upload. This worker is the only finalizer and runs one
+    // upload at a time, so the claim needs no lease; the five-minute clause only
+    // retries a claim abandoned by a crash or restart.
     let candidate = sqlx::query_as::<_, UploadSession>(
-        r#"UPDATE vault_upload_sessions SET error_code='PROCESSING', updated_at=now()
+        r#"UPDATE vault_upload_sessions SET error_code = 'PROCESSING', updated_at = ?1
            WHERE id = (
              SELECT id FROM vault_upload_sessions
-             WHERE state='finalizing' AND (error_code IS NULL OR updated_at < now() - interval '5 minutes')
-             ORDER BY updated_at FOR UPDATE SKIP LOCKED LIMIT 1
+             WHERE state = 'finalizing' AND (error_code IS NULL OR updated_at < ?2)
+             ORDER BY updated_at LIMIT 1
            ) RETURNING *"#,
     )
-    .fetch_optional(&state.pool)
+    .bind(db::ts(now))
+    .bind(db::ts(now - chrono::Duration::minutes(5)))
+    .fetch_optional(&state.db.write)
     .await?;
     if let Some(session) = candidate
         && let Err(error) = finalize_upload(state, &session).await
     {
         tracing::error!(upload_id=%session.id, %error, "upload finalization failed");
-        sqlx::query("UPDATE vault_upload_sessions SET state='failed', error_code='FINALIZATION_FAILED', updated_at=now() WHERE id=$1")
-            .bind(session.id).execute(&state.pool).await?;
+        sqlx::query("UPDATE vault_upload_sessions SET state = 'failed', error_code = 'FINALIZATION_FAILED', updated_at = ? WHERE id = ?")
+            .bind(db::now())
+            .bind(session.id)
+            .execute(&state.db.write)
+            .await?;
     }
     Ok(())
 }
 
 async fn finalize_upload(state: &AppState, session: &UploadSession) -> AppResult<()> {
-    // The durable advisory lease prevents another instance from finalizing this
-    // upload even if hashing a very large file exceeds the claim timeout.
-    let mut lease = state.pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(session.id.to_string())
-        .execute(&mut *lease)
-        .await?;
-    let current_state =
-        sqlx::query_scalar::<_, String>("SELECT state FROM vault_upload_sessions WHERE id=$1")
-            .bind(session.id)
-            .fetch_optional(&mut *lease)
-            .await?;
-    if current_state.as_deref() != Some("finalizing") {
-        lease.commit().await?;
-        return Ok(());
-    }
+    // Hash and sniff with no transaction open: this can take a while for large files.
     let path = safe_storage_path(state, &session.temp_storage_key)?;
     let mut file = tokio::fs::File::open(&path).await?;
     let actual = file.metadata().await?.len();
@@ -499,6 +542,7 @@ async fn finalize_upload(state: &AppState, session: &UploadSession) -> AppResult
         }
         hasher.update(&buffer[..read]);
     }
+    drop(file);
     let sha256 = hex::encode(hasher.finalize());
     let mime_type = sniff_mime(
         &signature,
@@ -512,22 +556,33 @@ async fn finalize_upload(state: &AppState, session: &UploadSession) -> AppResult
         size_bytes: actual,
         sha256,
     };
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.db.begin().await?;
+    let current_state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM vault_upload_sessions WHERE id = ?")
+            .bind(session.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if current_state.as_deref() != Some("finalizing") {
+        // Canceled or expired meanwhile: dropping `upload` removes the partial file.
+        return Ok(());
+    }
     let (blob, blob_created) = persist_blob(
         &mut tx,
-        &state.pool,
         &state.upload_root,
         &session.organization_id,
         &upload,
     )
     .await?;
     let kind = file_kind(&blob.mime_type);
+    let now = db::now();
     let inserted = sqlx::query_as::<_, ItemRow>(
         r#"INSERT INTO vault_items
-           (organization_id, created_by_user_id, created_by_key_id, kind, blob_id,
-            original_filename, virtual_path, source_url, tags, content_hash, size_bytes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *"#,
+           (id, organization_id, created_by_user_id, created_by_key_id, kind, blob_id,
+            original_filename, virtual_path, source_url, tags, content_hash, size_bytes,
+            created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *"#,
     )
+    .bind(Uuid::new_v4().hyphenated())
     .bind(&session.organization_id)
     .bind(&session.created_by_user_id)
     .bind(&session.created_by_key_id)
@@ -539,6 +594,8 @@ async fn finalize_upload(state: &AppState, session: &UploadSession) -> AppResult
     .bind(&session.tags)
     .bind(&upload.sha256)
     .bind(actual as i64)
+    .bind(&now)
+    .bind(&now)
     .fetch_one(&mut *tx)
     .await;
     let item = match inserted {
@@ -551,11 +608,17 @@ async fn finalize_upload(state: &AppState, session: &UploadSession) -> AppResult
             return Err(error.into());
         }
     };
-    sqlx::query("UPDATE vault_upload_sessions SET state='completed', item_id=$2, error_code=NULL, updated_at=now() WHERE id=$1")
-        .bind(session.id).bind(item.id).execute(&mut *tx).await?;
-    tx.commit().await?;
-    if let Err(error) = lease.commit().await {
-        tracing::warn!(upload_id=%session.id, %error, "finalization lease release failed after commit");
+    sqlx::query("UPDATE vault_upload_sessions SET state = 'completed', item_id = ?, error_code = NULL, updated_at = ? WHERE id = ?")
+        .bind(item.id)
+        .bind(&now)
+        .bind(session.id)
+        .execute(&mut *tx)
+        .await?;
+    if let Err(error) = tx.commit().await {
+        if blob_created {
+            let _ = tokio::fs::remove_file(state.upload_root.join(&blob.storage_key)).await;
+        }
+        return Err(error.into());
     }
     tracing::info!(upload_id=%session.id, item_id=%item.id, bytes=actual, "large upload finalized");
     Ok(())
@@ -567,11 +630,11 @@ async fn fetch_session(
     organization_id: &str,
 ) -> AppResult<UploadSession> {
     sqlx::query_as::<_, UploadSession>(
-        "SELECT * FROM vault_upload_sessions WHERE id=$1 AND organization_id=$2",
+        "SELECT * FROM vault_upload_sessions WHERE id = ? AND organization_id = ?",
     )
-    .bind(id)
+    .bind(id.hyphenated())
     .bind(organization_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.db.read)
     .await?
     .ok_or(AppError::NotFound)
 }

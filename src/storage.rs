@@ -2,11 +2,12 @@ use std::path::{Path, PathBuf};
 
 use axum::extract::multipart::Field;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::SqliteConnection;
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::{
+    db,
     error::{AppError, AppResult},
     models::BlobRow,
 };
@@ -93,26 +94,32 @@ pub async fn stream_field_to_temp(
     })
 }
 
+/// Moves a finished upload into content-addressed storage, or reuses the blob this
+/// workspace already holds with the same SHA-256.
+///
+/// Runs inside the caller's write transaction (`BEGIN IMMEDIATE`), which holds the
+/// database write lock, so the duplicate check and the insert cannot race. Returns
+/// the blob and whether this call created it (so the caller can unlink the file if
+/// its own insert fails afterwards).
 pub async fn persist_blob(
-    tx: &mut Transaction<'_, Postgres>,
-    pool: &PgPool,
+    connection: &mut SqliteConnection,
     upload_root: &Path,
     organization_id: &str,
     upload: &TempUpload,
 ) -> AppResult<(BlobRow, bool)> {
     if let Some(existing) = sqlx::query_as::<_, BlobRow>(
-        "SELECT id, storage_key, size_bytes, mime_type FROM vault_blobs WHERE organization_id = $1 AND sha256 = $2",
+        "SELECT id, storage_key, size_bytes, mime_type FROM vault_blobs WHERE organization_id = ? AND sha256 = ?",
     )
     .bind(organization_id)
     .bind(&upload.sha256)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *connection)
     .await?
     {
         let _ = fs::remove_file(&upload.path).await;
         return Ok((existing, false));
     }
 
-    let blob_id = Uuid::new_v4();
+    let blob_id = Uuid::new_v4().hyphenated();
     let storage_key = format!(
         "{}/{}/{}/{}",
         safe_component(organization_id),
@@ -126,10 +133,9 @@ pub async fn persist_blob(
     }
     fs::rename(&upload.path, &destination).await?;
 
-    let inserted_result = sqlx::query_as::<_, BlobRow>(
-        r#"INSERT INTO vault_blobs (id, organization_id, sha256, storage_key, size_bytes, mime_type)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (organization_id, sha256) DO NOTHING
+    let inserted = sqlx::query_as::<_, BlobRow>(
+        r#"INSERT INTO vault_blobs (id, organization_id, sha256, storage_key, size_bytes, mime_type, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            RETURNING id, storage_key, size_bytes, mime_type"#,
     )
     .bind(blob_id)
@@ -138,28 +144,16 @@ pub async fn persist_blob(
     .bind(&storage_key)
     .bind(upload.size_bytes as i64)
     .bind(&upload.mime_type)
-    .fetch_optional(&mut **tx)
+    .bind(db::now())
+    .fetch_one(&mut *connection)
     .await;
-    let inserted = match inserted_result {
-        Ok(inserted) => inserted,
+    match inserted {
+        Ok(blob) => Ok((blob, true)),
         Err(error) => {
             let _ = fs::remove_file(&destination).await;
-            return Err(error.into());
+            Err(error.into())
         }
-    };
-
-    if let Some(blob) = inserted {
-        return Ok((blob, true));
     }
-    let _ = fs::remove_file(&destination).await;
-    let existing = sqlx::query_as::<_, BlobRow>(
-        "SELECT id, storage_key, size_bytes, mime_type FROM vault_blobs WHERE organization_id = $1 AND sha256 = $2",
-    )
-    .bind(organization_id)
-    .bind(&upload.sha256)
-    .fetch_one(pool)
-    .await?;
-    Ok((existing, false))
 }
 
 pub fn normalize_virtual_path(value: &str) -> AppResult<String> {

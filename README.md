@@ -2,9 +2,13 @@
 
 A lightweight, self-hosted team vault for pasted text and arbitrary files.
 
-The main application is a Rust/Axum server. A small Hono service runs Better Auth for
-password and optional Google, GitHub, or Discord login, account approvals, workspaces, and API keys. PostgreSQL
-stores searchable metadata; file bytes stay on a persistent VPS volume.
+Clipboard Vault 3.x is one Rust/Axum binary in one container. It serves the pages, the JSON
+API, resumable uploads, and its own sign-in (password plus optional Google, GitHub, or
+Discord). Metadata, accounts, sessions, and API keys live in an SQLite database; file bytes
+stay on disk next to it. Everything the server writes is under one data volume, `/data`.
+
+Upgrading from 2.x (PostgreSQL plus a separate Node.js auth service)? That is not an in-place
+upgrade. Follow [Moving from 2.x to 3.0](DEPLOYMENT.md#moving-from-2x-to-30).
 
 ## What it does
 
@@ -12,11 +16,12 @@ stores searchable metadata; file bytes stay on a persistent VPS volume.
 - Resumable, streamed file uploads up to 10 GiB without loading the whole file into memory.
 - Inline previews for text, code, safe HTML/Markdown, images, and ranged PDFs.
 - Private workspaces with owner, admin, and member roles.
-- Global approval queue for every new account.
-- Password login plus optional Google, GitHub, and Discord login through Better Auth.
+- An approval queue for new accounts, which global admins can turn off.
+- Password sign-in plus optional Google, GitHub, and Discord sign-in, built into the server.
 - Workspace API keys with read, write, and delete permissions.
 - Ready-to-run Python multipart and resumable file uploaders.
 - Trash, restore, search, tags, exports, and activity records.
+- Daily consistent database snapshots and an admin snapshot download.
 - Docker Compose, Nginx, Certbot, health checks, and GitHub Actions.
 
 Clipboard Vault never reads or monitors the browser clipboard on its own. It sees clipboard
@@ -28,24 +33,57 @@ button, which writes to the clipboard.
 
 ```mermaid
 flowchart LR
-  Browser["Browser or Python script"] --> Nginx["Nginx + HTTPS"]
-  Nginx --> Rust["Rust vault service"]
-  Nginx --> Auth["Hono + Better Auth"]
-  Rust --> Auth
-  Rust --> Postgres["PostgreSQL"]
-  Auth --> Postgres
-  Rust --> Files["Persistent file volume"]
+  Browser["Browser or Python script"] --> Proxy["Nginx + HTTPS (or another proxy)"]
+  Proxy --> Vault["clipboard-vault (one process)"]
+  Vault --> DB["/data/vault.db (SQLite, WAL)"]
+  Vault --> Files["/data/uploads/"]
+  Vault --> Backups["/data/backups/"]
 ```
 
-Only Nginx exposes ports 80 and 443. The Rust, authentication, and database services
-communicate through a private Docker network.
+- **One process.** Pages, `/api/v1/*`, Tus uploads, `/api/auth/*`, admin actions, health
+  checks, and `/static/*` are all served by the same binary on port 8080. There is no
+  separate auth service, no internal bridge, and no shared secret between services.
+- **SQLite on the data volume.** The database is `$DATA_DIR/vault.db` in WAL mode, with one
+  write connection and a pool of read connections. Every change goes through the single
+  writer, so writes are serialized.
+- **Files next to it.** Uploaded bytes are streamed to `$DATA_DIR/uploads/`. The database
+  stores their metadata and a relative `storage_key`; large payloads are never buffered in
+  memory.
+- **Snapshots.** Once a day the server writes `$DATA_DIR/backups/vault-YYYY-MM-DD.db` with
+  `VACUUM INTO` and keeps the newest `BACKUP_KEEP` (7 by default).
+- **Proxy.** The Compose file puts Nginx in front for HTTPS and request limits; Nginx sends
+  every path, including `/api/auth/`, to `vault:8080`. Behind another proxy you can drop
+  Nginx and publish the vault port instead.
+
+The container runs as uid 10001 on a distroless base (no shell), works with a read-only root
+filesystem, and writes only to `/data` (plus a `/tmp` tmpfs). It typically uses 64–192 MiB of
+memory.
+
+### Request flow
+
+**Page request.** The browser sends the `vault_session` cookie. The server hashes the cookie
+value, looks the session up in SQLite, resolves the user, approval state, workspace, and role,
+queries the vault, and renders an Askama template. Pages load `/static/theme.js` first (so the
+stored theme applies before first paint), then `/static/app.css`, `/static/app.js`, and the
+vendored preview libraries.
+
+**Sign-in.** `static/app.js` posts to `/api/auth/*`. The server checks that the request's
+`Origin` matches `PUBLIC_BASE_URL`, applies per-address rate limits, verifies the password or
+completes the social sign-in, and sets or clears the session cookie. The browser then
+navigates back to a server-rendered page.
+
+**API or upload request.** The server accepts a session cookie, `Authorization: Bearer`, or
+`X-API-Key`. An API key decides the workspace and its permissions; clients cannot choose
+another workspace ID. The server checks the role or key permission, updates metadata in a
+transaction, and streams file bytes to or from `/data/uploads`. Multipart uploads are the
+compatibility path; large uploads use Tus.
 
 ## Quick start
 
 Requirements:
 
 - Docker Engine 25 or newer with Docker Compose 2.20.2 or newer.
-- A domain name for production social login and HTTPS.
+- A domain name for production social sign-in and HTTPS.
 - A client ID and secret for each social provider you enable.
 
 ```bash
@@ -54,22 +92,65 @@ cp .env.example .env
 docker compose up --build
 ```
 
-For password-only local testing, set `DOMAIN=localhost` and
-`PUBLIC_BASE_URL=http://localhost` in `.env`, then open `http://localhost`. The first registered user
-must visit `/setup` and enter `BOOTSTRAP_TOKEN`. After that succeeds, the setup
-route refuses all future claims.
-
-Generate independent secrets with:
+Two settings are required. Generate each one separately:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Run that command separately for `POSTGRES_PASSWORD`, `BETTER_AUTH_SECRET`,
-`AUTH_BRIDGE_SECRET`, and `BOOTSTRAP_TOKEN`. Never commit the resulting
-`.env` file. Hex output is intentional: it is safe inside the PostgreSQL connection URL.
+| Variable | Purpose |
+| --- | --- |
+| `VAULT_SECRET` | At least 32 characters. Signs the short-lived social sign-in state cookie. Changing it only interrupts sign-ins in progress. |
+| `SETUP_TOKEN` | At least 32 characters. Claims the first administrator on `/setup`. |
+
+The server refuses to start without them. Never commit the resulting `.env` file.
+
+For password-only local testing, set `DOMAIN=localhost` and `PUBLIC_BASE_URL=http://localhost`
+in `.env`, then open exactly `http://localhost` (not `127.0.0.1`: sign-in requests must come
+from the `PUBLIC_BASE_URL` origin). Register an account, visit `/setup`, and enter
+`SETUP_TOKEN`. After that succeeds, the setup route refuses all future claims.
+
+You can also run the binary without Docker. It serves `static/` from the working directory,
+so run it from the repository root:
+
+```bash
+VAULT_SECRET=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) \
+  DATA_DIR=./data PUBLIC_BASE_URL=http://localhost:8080 cargo run
+```
+
+A new secret on every start is fine for `VAULT_SECRET`, but note the `SETUP_TOKEN` you used
+until you have claimed the first admin.
 
 For a real VPS, follow [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### Configuration
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `VAULT_SECRET` | required | See above. |
+| `SETUP_TOKEN` | required | See above. Replaces the 2.x `BOOTSTRAP_TOKEN`. |
+| `PUBLIC_BASE_URL` | `http://localhost:8080` | The exact address people use, such as `https://vault.example.com`. Used for the sign-in `Origin` check, social callbacks, and secure cookies (`https://` turns on `Secure`). |
+| `DATA_DIR` | `/data` | Holds `vault.db`, `uploads/`, and `backups/`. |
+| `UPLOAD_ROOT` | `$DATA_DIR/uploads` | Where file bytes are stored. |
+| `TRUST_PROXY_HEADERS` | `false` | When `true`, the right-most `X-Forwarded-For` entry is the client address used for rate limits. Enable it only behind a proxy that appends that header. The Compose file sets it to `true` because its Nginx does. |
+| `BACKUP_KEEP` | `7` | Daily snapshots to keep. `0` disables them. |
+| `DATABASE_READ_CONNECTIONS` | `8` | Size of the SQLite read pool. |
+| `PORT` | `8080` | HTTP port inside the container. |
+| `SERVER_MAX_UPLOAD_BYTES` | 10 GiB | Absolute per-file ceiling. |
+| `LEGACY_MAX_UPLOAD_BYTES` | 100 MiB | Limit for the multipart endpoint. |
+| `TUS_CHUNK_SIZE_BYTES` | 16 MiB | Tus chunk size. |
+| `TUS_SESSION_TTL_SECONDS` | 7 days | Idle Tus sessions expire after this. |
+| `UPLOAD_DISK_RESERVE_BYTES` | 20 GiB | Uploads are refused before free space falls below this. |
+| `GOOGLE_`, `GITHUB_`, `DISCORD_CLIENT_ID` / `_CLIENT_SECRET` | blank | Optional social sign-in; set both values of a pair. |
+| `RUST_LOG` | `clipboard_vault=info,tower_http=info` | Log filter. |
+
+`DOMAIN`, `NGINX_LEGACY_CLIENT_MAX_BODY_SIZE`, `NGINX_TUS_CLIENT_MAX_BODY_SIZE`, and
+`VAULT_MEMORY_LIMIT` (default `256m`) are read by Docker Compose and Nginx, not by the binary.
+
+These 2.x variables are retired and no longer read: `DATABASE_URL`, `BETTER_AUTH_SECRET`,
+`BETTER_AUTH_URL`, `AUTH_BRIDGE_SECRET`, `AUTH_INTERNAL_URL`, `AUTH_PROXY_ENABLED`,
+`BOOTSTRAP_TOKEN`, and the `POSTGRES_*` variables. If one of the first seven reaches the
+binary, it logs a startup warning so a half-migrated `.env` is noticed.
 
 ## Social authentication
 
@@ -77,7 +158,8 @@ Social providers are enabled only when both variables in their credential pair a
 partial pair fails startup with the missing variable named in the error; no credentials are
 ever returned by the provider-discovery endpoint.
 
-Register these exact production callbacks in the relevant provider console:
+Register these exact production callbacks in the relevant provider console. They are the same
+as in 2.x, so existing provider registrations keep working:
 
 ```text
 https://vault.your-domain.com/api/auth/callback/google
@@ -102,14 +184,15 @@ For Google, create a Web application OAuth client. For GitHub OAuth Apps, reques
 `user:email`; GitHub Apps additionally need read-only Email addresses permission. Discord
 uses only `identify` and `email`, with no bot or guild permissions.
 
-Better Auth links a social identity to an existing user only when the provider verifies the
-same email address. Different-email linking, forced trusted-provider linking, profile
-overwrites during linking, and unlinking the last identity are disabled. A provider account
-without a verified email is rejected rather than assigned a placeholder address.
+A social identity is linked to an existing user only when the provider verifies the same
+email address. Different-email linking and automatic linking without a verified email are not
+possible. A provider account without a verified email is rejected rather than assigned a
+placeholder address. Sign-in uses the authorization-code flow with PKCE; its state lives in a
+10-minute cookie signed with `VAULT_SECRET`.
 
-To add another built-in Better Auth provider, extend the typed registry in
-`auth/src/providers.ts`, add its credential pair, tests, callback documentation, and release
-it normally. The login page does not need provider-specific browser logic.
+To add another provider, extend the provider registry in `src/identity/oauth.rs`, add its
+credential pair, tests, and callback documentation, and release it normally. The login page
+does not need provider-specific browser logic.
 
 For example, in Google Cloud Console:
 
@@ -142,18 +225,32 @@ require HTTPS and normally cannot use a raw VPS IP address.
 
 Global administrators manage the server from **Administration**:
 
-- Open or close registration. When closed, `/sign-up/email` and first-time social sign-ins
-  are refused, and only administrators create accounts.
+- Open or close registration. When closed, `/api/auth/sign-up/email` and first-time social
+  sign-ins are refused, and only administrators create accounts.
 - Require approval for new accounts, or let them open their workspace immediately.
 - Set the default per-file upload limit (10 GiB unless lowered; capped by
   `SERVER_MAX_UPLOAD_BYTES`). Workspace owners can still choose their own limit.
 - Create approved accounts with a password, grant or remove the administrator role, disable
   and re-enable accounts, sign an account out everywhere, issue reset links, and delete an
   account together with the workspaces only it owns.
+- Download a fresh, consistent database snapshot with **Download database snapshot** on the Admin page (`/admin/backup`).
 
-The first admin is protected by the private `BOOTSTRAP_TOKEN`. Choose a random value,
-register the intended account, visit `/setup`, and claim the instance before sharing
-the site.
+The first admin is protected by the private `SETUP_TOKEN`. Register the intended account,
+visit `/setup`, and claim the instance before sharing the site.
+
+### Sign-in security
+
+- Passwords are 8–128 characters and hashed with Argon2id. Accounts imported from 2.x keep
+  their Better Auth scrypt hashes, which verify normally and are replaced with Argon2id on the
+  next successful sign-in.
+- The session cookie `vault_session` holds 32 random bytes (`HttpOnly`, `SameSite=Lax`, and
+  `Secure` when `PUBLIC_BASE_URL` is HTTPS). Only its SHA-256 is stored. Sessions last 7 days
+  and slide forward at most once a day.
+- Every state-changing `/api/auth/*` request must carry an `Origin` equal to
+  `PUBLIC_BASE_URL`; others are refused with `INVALID_ORIGIN`.
+- Rate limits are kept in memory per client address: sign-in 10 per minute, sign-up 5 per
+  5 minutes, password reset 3 per 5 minutes. API keys are limited to 120 requests per minute
+  each. Limits reset when the process restarts.
 
 ## API keys
 
@@ -161,6 +258,9 @@ Open Keys & team inside a workspace. Create a named key, choose its expiration a
 permissions, then copy it immediately. The complete key is shown once.
 
 The key decides the workspace. Scripts cannot submit another workspace ID.
+
+Keys look like `cv_live_…` and only their SHA-256 hash is stored. The format and hashing are
+the same as in 2.x, so keys created on 2.x keep working after the move to 3.0.
 
 ### Paste text
 
@@ -210,7 +310,7 @@ the whole trash. Both need the `items:delete` permission.
 `static/vault.py` is a single-file command-line client that uses only the Python standard
 library (3.8+). Creating a key in the browser offers a copy with the server address and the
 new key filled in; **Keys and team** also links a blank copy that reads `VAULT_SERVER` and
-`VAULT_API_KEY` from the environment.
+`VAULT_API_KEY` from the environment. It is unchanged in 3.0.
 
 ```bash
 python vault.py up report.pdf screenshots/        # parallel, resumable uploads of any size
@@ -271,7 +371,9 @@ The API returns a consistent error body:
 }
 ```
 
-### API route summary
+### Route summary
+
+Vault API (session cookie or API key):
 
 | Method | Route | Purpose |
 | --- | --- | --- |
@@ -291,25 +393,60 @@ The API returns a consistent error body:
 | `POST` | `/api/v1/storage/purge` | Explicitly purge selected file items (owner/admin) |
 | `GET` | `/api/v1/items/export?format=json|csv` | Export active item metadata and text |
 | `GET` | `/api/v1/tags` | List workspace tags |
-| `GET` | `/health/live`, `/health/ready` | Process and dependency health |
+
+Authentication (used by the browser; same paths and JSON shapes as 2.x):
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/auth/sign-in/email` | Sign in with `{email, password}` and set the session cookie |
+| `POST` | `/api/auth/sign-up/email` | Register with `{name, email, password}` (honors closed registration and approval) |
+| `POST` | `/api/auth/sign-out` | Delete the session and clear the cookie |
+| `POST` | `/api/auth/reset-password` | Set a new password with `{token, newPassword}` from a reset link |
+| `POST` | `/api/auth/vault/bootstrap` | Claim the first administrator with `{token}` (`SETUP_TOKEN`) |
+| `GET` | `/api/auth/vault/providers` | List the enabled social providers |
+| `POST` | `/api/auth/sign-in/social` | Start a Google, GitHub, or Discord sign-in |
+| `GET` | `/api/auth/callback/{provider}` | Social sign-in callback (register this in the provider console) |
+
+Administration and health:
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/admin/backup` | Download a fresh database snapshot (global admins only) |
+| `GET` | `/health/live` | The process is up |
+| `GET` | `/health/ready` | The process is up and the database answers |
 
 ## Development checks
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cd auth && pnpm install --frozen-lockfile && pnpm test && pnpm build
+cargo test --all-features
 python -m pytest -q tests
+docker compose config --quiet
 ```
+
+`cargo test` runs the page, API, and auth tests against temporary SQLite files; no database
+server is needed. The PostgreSQL import test (`tests/import_postgres.rs`) is skipped unless
+`IMPORT_TEST_DATABASE_URL=postgresql://…` points at a disposable PostgreSQL database; it drops
+and recreates the schema there. To run it locally:
+
+```bash
+# In one terminal (stops and removes itself on Ctrl+C):
+docker run --rm -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=test postgres:17-alpine
+# In another:
+IMPORT_TEST_DATABASE_URL=postgresql://postgres:test@127.0.0.1:55432/postgres \
+  cargo test --all-features --test import_postgres
+```
+
+CI runs it against a PostgreSQL service.
 
 On Windows, local Rust compilation needs a compatible linker. It is not necessary to install
 Visual Studio if development and builds are performed inside Linux, Docker, WSL, CI, or the
-VPS. Production images compile Rust inside the official Linux Rust container.
+VPS. Production images compile Rust inside the official Alpine Rust container.
 
 ## Documentation
 
-- [VPS deployment, HTTPS, upgrades, and rollback](DEPLOYMENT.md)
+- [VPS deployment, HTTPS, backups, upgrades, rollback, and moving from 2.x](DEPLOYMENT.md)
 - [Security model and reporting](SECURITY.md)
 - [.env configuration template](.env.example)
 

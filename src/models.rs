@@ -1,11 +1,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use uuid::Uuid;
 
+use crate::db::Id;
+
+/// The signed-in person, as page templates and authorization see them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BridgeUser {
+pub struct SessionUser {
     pub id: String,
     pub name: String,
     pub email: String,
@@ -14,7 +16,7 @@ pub struct BridgeUser {
     pub approval_status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct Membership {
     pub organization_id: String,
@@ -23,10 +25,12 @@ pub struct Membership {
     pub role: String,
 }
 
+/// A resolved browser session: the user plus their workspaces, with the active one
+/// chosen from the `vault_workspace` cookie (falling back to the oldest membership).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BridgeSession {
-    pub user: BridgeUser,
+pub struct UserSession {
+    pub user: SessionUser,
     pub active_organization_id: Option<String>,
     pub active_role: Option<String>,
     #[serde(default)]
@@ -54,14 +58,14 @@ pub struct AuthContext {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct ItemRow {
-    pub id: Uuid,
+    pub id: Id,
     pub organization_id: String,
     pub created_by_user_id: Option<String>,
     pub created_by_key_id: Option<String>,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_payload: Option<String>,
-    pub blob_id: Option<Uuid>,
+    pub blob_id: Option<Id>,
     pub original_filename: Option<String>,
     pub virtual_path: String,
     pub source_url: Option<String>,
@@ -221,7 +225,7 @@ impl ItemRow {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct BlobRow {
-    pub id: Uuid,
+    pub id: Id,
     pub storage_key: String,
     pub size_bytes: i64,
     pub mime_type: String,
@@ -277,7 +281,7 @@ mod tests {
 
     fn item(text: Option<&str>, filename: Option<&str>, kind: &str) -> ItemRow {
         ItemRow {
-            id: uuid::Uuid::nil(),
+            id: uuid::Uuid::nil().hyphenated(),
             organization_id: "org".into(),
             created_by_user_id: None,
             created_by_key_id: None,

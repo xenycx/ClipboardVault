@@ -1,44 +1,8 @@
 name: clipboard-vault
+# One application container and one data volume. Nginx and certbot are optional:
+# keep them when this host terminates TLS itself; behind another proxy, drop them,
+# publish the vault port, and set TRUST_PROXY_HEADERS to match that proxy.
 services:
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-clipboard_vault}
-      POSTGRES_USER: ${POSTGRES_USER:-vault}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./auth/migrations/auth-schema.sql:/docker-entrypoint-initdb.d/001-auth.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vault} -d ${POSTGRES_DB:-clipboard_vault}"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    networks: [backend]
-  auth:
-    build: { context: ./auth }
-    image: clipboard-vault-auth:local
-    restart: unless-stopped
-    environment:
-      AUTH_PORT: "3001"
-      DATABASE_URL: postgresql://${POSTGRES_USER:-vault}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-clipboard_vault}
-      BETTER_AUTH_URL: ${PUBLIC_BASE_URL}
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
-      AUTH_BRIDGE_SECRET: ${AUTH_BRIDGE_SECRET}
-      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
-      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
-      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
-      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
-    depends_on:
-      postgres: { condition: service_healthy }
-    networks: [backend]
-    read_only: true
-    tmpfs: [/tmp]
-    security_opt: [no-new-privileges:true]
   vault:
     build: { context: . }
     image: clipboard-vault:local
@@ -46,24 +10,30 @@ services:
     environment:
       PORT: "8080"
       RUST_LOG: ${RUST_LOG:-clipboard_vault=info,tower_http=info}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-vault}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-clipboard_vault}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
-      AUTH_INTERNAL_URL: http://auth:3001
-      AUTH_BRIDGE_SECRET: ${AUTH_BRIDGE_SECRET}
-      UPLOAD_ROOT: /data/uploads
+      VAULT_SECRET: ${VAULT_SECRET:?Set VAULT_SECRET in .env}
+      SETUP_TOKEN: ${SETUP_TOKEN:?Set SETUP_TOKEN in .env}
+      DATA_DIR: /data
+      # Nginx below appends the client address to X-Forwarded-For.
+      TRUST_PROXY_HEADERS: "true"
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
       SERVER_MAX_UPLOAD_BYTES: ${SERVER_MAX_UPLOAD_BYTES:-10737418240}
       LEGACY_MAX_UPLOAD_BYTES: ${LEGACY_MAX_UPLOAD_BYTES:-104857600}
       TUS_CHUNK_SIZE_BYTES: ${TUS_CHUNK_SIZE_BYTES:-16777216}
       TUS_SESSION_TTL_SECONDS: ${TUS_SESSION_TTL_SECONDS:-604800}
       UPLOAD_DISK_RESERVE_BYTES: ${UPLOAD_DISK_RESERVE_BYTES:-21474836480}
-    volumes: [vault-files:/data/uploads]
-    depends_on:
-      postgres: { condition: service_healthy }
-      auth: { condition: service_healthy }
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+    volumes: [vault-data:/data]
     networks: [backend]
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
+    mem_limit: ${VAULT_MEMORY_LIMIT:-256m}
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
@@ -83,7 +53,6 @@ services:
       - letsencrypt:/etc/letsencrypt:ro
     depends_on:
       vault: { condition: service_healthy }
-      auth: { condition: service_healthy }
     networks: [edge, backend]
     security_opt: [no-new-privileges:true]
   certbot:
@@ -97,7 +66,6 @@ networks:
   edge:
   backend: { internal: true }
 volumes:
-  postgres-data:
-  vault-files:
+  vault-data:
   certbot-web:
   letsencrypt:

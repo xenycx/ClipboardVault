@@ -9,19 +9,24 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
 };
 use chrono::{Duration, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AppState, api,
-    auth::workspace_cookie,
+    AppState, api, auth,
+    db::{self, Id},
     error::{AppError, AppResult},
     filters,
-    models::{AuthContext, BridgeSession, ItemCreate, ItemRow},
+    identity::{
+        self, ServerSettings,
+        admin::{self as accounts, AdminUser},
+        keys::{self, ApiKeySummary},
+        workspaces::{self, WorkspaceMember},
+    },
+    models::{AuthContext, ItemCreate, ItemRow, UserSession},
 };
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{QueryBuilder, Sqlite};
 
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -43,7 +48,7 @@ struct SetupTemplate;
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
-    session: BridgeSession,
+    session: UserSession,
     items: Vec<ItemRow>,
     max_upload_mb: u64,
     max_upload_bytes: u64,
@@ -70,29 +75,10 @@ pub struct VaultQuery {
     trash: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiKeySummary {
-    id: String,
-    name: String,
-    start: String,
-    #[allow(dead_code)]
-    created_by_user_id: Option<String>,
-    permissions: Vec<String>,
-    expires_at: Option<String>,
-    #[allow(dead_code)]
-    created_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct KeyList {
-    keys: Vec<ApiKeySummary>,
-}
-
 #[derive(Template)]
 #[template(path = "keys.html")]
 struct KeysTemplate {
-    session: BridgeSession,
+    session: UserSession,
     nav: &'static str,
     workspace_name: String,
     keys: Vec<ApiKeySummary>,
@@ -102,76 +88,6 @@ struct KeysTemplate {
     can_manage: bool,
     is_owner: bool,
     server_url: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceMember {
-    id: String,
-    name: String,
-    email: String,
-    role: String,
-    created_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceDetails {
-    members: Vec<WorkspaceMember>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AdminUser {
-    id: String,
-    name: String,
-    email: String,
-    approval_status: String,
-    role: String,
-    created_at: String,
-    #[serde(default)]
-    banned: bool,
-}
-
-impl AdminUser {
-    fn is_admin(&self) -> bool {
-        self.role.split(',').any(|role| role.trim() == "admin")
-    }
-    fn joined(&self) -> String {
-        self.created_at
-            .get(..10)
-            .unwrap_or(&self.created_at)
-            .to_string()
-    }
-}
-
-/// Server-wide settings owned by global administrators (`vault_server_settings`).
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ServerSettings {
-    pub registration_enabled: bool,
-    pub require_approval: bool,
-    pub default_max_upload_bytes: i64,
-}
-
-impl Default for ServerSettings {
-    fn default() -> Self {
-        Self {
-            registration_enabled: true,
-            require_approval: true,
-            default_max_upload_bytes: 10_737_418_240,
-        }
-    }
-}
-
-pub(crate) async fn server_settings(pool: &sqlx::PgPool) -> ServerSettings {
-    sqlx::query_as::<_, ServerSettings>(
-        "SELECT registration_enabled, require_approval, default_max_upload_bytes FROM vault_server_settings WHERE id",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default()
 }
 
 struct AdminStats {
@@ -186,15 +102,10 @@ struct Notice {
     text: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct AdminUsers {
-    users: Vec<AdminUser>,
-}
-
 #[derive(Template)]
 #[template(path = "admin.html")]
 struct AdminTemplate {
-    session: BridgeSession,
+    session: UserSession,
     nav: &'static str,
     users: Vec<AdminUser>,
     pending: usize,
@@ -209,7 +120,7 @@ struct AdminTemplate {
 #[derive(Template)]
 #[template(path = "storage.html")]
 pub struct StorageTemplate {
-    pub session: BridgeSession,
+    pub session: UserSession,
     pub nav: &'static str,
     pub workspace_name: String,
     pub free_bytes: u64,
@@ -256,54 +167,22 @@ struct ResetPasswordTemplate {
     token: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct SecretResult {
-    secret: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct UrlResult {
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OkResult {
-    #[allow(dead_code)]
-    ok: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeleteWorkspaceResult {
-    #[allow(dead_code)]
-    ok: bool,
-    storage_keys: Vec<String>,
-}
-
 pub async fn login(State(state): State<AppState>) -> AppResult<Html<String>> {
-    let settings = server_settings(&state.pool).await;
+    let settings = identity::server_settings(&state.db).await;
     render(LoginTemplate {
         registration_enabled: settings.registration_enabled,
     })
 }
+
 pub async fn setup(State(state): State<AppState>) -> AppResult<Html<String>> {
-    let configured = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM \"user\" WHERE string_to_array(coalesce(role,''), ',') @> ARRAY['admin'])",
-    )
-    .fetch_one(&state.pool)
-    .await?;
-    if configured {
+    if identity::any_admin_exists(&state.db).await? {
         return Err(AppError::NotFound);
     }
     render(SetupTemplate)
 }
 
 pub async fn pending(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
-    let session = match state
-        .auth
-        .session(&headers, workspace_cookie(&headers))
-        .await
-    {
+    let session = match auth::session(&state, &headers).await {
         Ok(session) => session,
         Err(AppError::Unauthorized) => return Ok(Redirect::to("/login").into_response()),
         Err(error) => return Err(error),
@@ -323,11 +202,7 @@ pub async fn dashboard(
     headers: HeaderMap,
     Query(query): Query<VaultQuery>,
 ) -> AppResult<Response> {
-    let session = match state
-        .auth
-        .session(&headers, workspace_cookie(&headers))
-        .await
-    {
+    let session = match auth::session(&state, &headers).await {
         Ok(session) => session,
         Err(AppError::Unauthorized) => return Ok(Redirect::to("/login").into_response()),
         Err(error) => return Err(error),
@@ -356,7 +231,7 @@ pub async fn dashboard(
     let kind_filter = (!kind.is_empty() && kind != "all").then(|| kind.clone());
 
     let mut builder =
-        QueryBuilder::<Postgres>::new("SELECT * FROM vault_items WHERE organization_id = ");
+        QueryBuilder::<Sqlite>::new("SELECT * FROM vault_items WHERE organization_id = ");
     builder.push_bind(&organization_id);
     builder.push(if trash {
         " AND deleted_at IS NOT NULL"
@@ -370,16 +245,16 @@ pub async fn dashboard(
     builder.push(" ORDER BY pinned DESC, created_at DESC LIMIT 100");
     let items = builder
         .build_query_as::<ItemRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&state.db.read)
         .await?;
 
     let counts = sqlx::query_as::<_, (String, i64)>(if trash {
-        "SELECT kind, count(*) FROM vault_items WHERE organization_id = $1 AND deleted_at IS NOT NULL GROUP BY kind"
+        "SELECT kind, count(*) FROM vault_items WHERE organization_id = ? AND deleted_at IS NOT NULL GROUP BY kind"
     } else {
-        "SELECT kind, count(*) FROM vault_items WHERE organization_id = $1 AND deleted_at IS NULL GROUP BY kind"
+        "SELECT kind, count(*) FROM vault_items WHERE organization_id = ? AND deleted_at IS NULL GROUP BY kind"
     })
     .bind(&organization_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.db.read)
     .await?;
     let chips = build_chips(&counts, kind_filter.as_deref(), &search, trash);
     let total = counts.iter().map(|(_, count)| count).sum();
@@ -458,18 +333,8 @@ pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResul
         .clone()
         .ok_or(AppError::Forbidden)?;
     let user_id = session.user.id.clone();
-    let path = format!(
-        "/internal/api-keys?organizationId={}&requesterId={}",
-        urlencoding(&organization_id),
-        urlencoding(&user_id)
-    );
-    let list: KeyList = state.auth.get_json(&path, &[]).await?;
-    let details_path = format!(
-        "/internal/workspaces/details?organizationId={}&requesterId={}",
-        urlencoding(&organization_id),
-        urlencoding(&user_id)
-    );
-    let details: WorkspaceDetails = state.auth.get_json(&details_path, &[]).await?;
+    let keys = keys::list(&state.db, &organization_id, &user_id).await?;
+    let members = workspaces::members(&state.db, &organization_id, &user_id).await?;
     let effective_limit = api::workspace_limit(&state, &organization_id).await?;
     let workspace_name = session
         .memberships
@@ -484,8 +349,8 @@ pub async fn keys(State(state): State<AppState>, headers: HeaderMap) -> AppResul
         session,
         nav: "keys",
         workspace_name,
-        keys: list.keys,
-        members: details.members,
+        keys,
+        members,
         max_upload_mb: effective_limit / 1024 / 1024,
         server_max_upload_mb: state.server_max_upload_bytes / 1024 / 1024,
         can_manage,
@@ -548,7 +413,7 @@ pub async fn storage_purge(
     Ok(Redirect::to("/storage"))
 }
 
-fn page_auth_context(session: &BridgeSession) -> AppResult<AuthContext> {
+fn page_auth_context(session: &UserSession) -> AppResult<AuthContext> {
     Ok(AuthContext {
         user_id: Some(session.user.id.clone()),
         api_key_id: None,
@@ -560,7 +425,7 @@ fn page_auth_context(session: &BridgeSession) -> AppResult<AuthContext> {
             .active_role
             .clone()
             .unwrap_or_else(|| "member".into()),
-        is_global_admin: session.user.role.split(',').any(|role| role == "admin"),
+        is_global_admin: identity::is_admin_role(&session.user.role),
     })
 }
 
@@ -598,15 +463,10 @@ fn notice_text(code: &str) -> Option<&'static str> {
 
 async fn render_admin(
     state: &AppState,
-    session: BridgeSession,
+    session: UserSession,
     notice: Option<Notice>,
 ) -> AppResult<Response> {
-    let path = format!(
-        "/internal/admin/users?requesterId={}",
-        urlencoding(&session.user.id)
-    );
-    let payload: AdminUsers = state.auth.get_json(&path, &[]).await?;
-    let mut users = payload.users;
+    let mut users = accounts::list_users(&state.db, &session.user.id).await?;
     // Anything waiting on a decision belongs at the top of the queue.
     users.sort_by_key(|user| match user.approval_status.as_str() {
         "pending" => 0,
@@ -618,19 +478,18 @@ async fn render_admin(
         .filter(|user| user.approval_status == "pending")
         .count();
     let admins = users.iter().filter(|user| user.is_admin()).count();
-    let settings = server_settings(&state.pool).await;
+    let settings = identity::server_settings(&state.db).await;
     let (items, trashed) = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT (count(*) FILTER (WHERE deleted_at IS NULL))::bigint, (count(*) FILTER (WHERE deleted_at IS NOT NULL))::bigint FROM vault_items",
+        "SELECT count(*) FILTER (WHERE deleted_at IS NULL), count(*) FILTER (WHERE deleted_at IS NOT NULL) FROM vault_items",
     )
-    .fetch_one(&state.pool)
+    .fetch_one(&state.db.read)
     .await?;
-    let stored_bytes = sqlx::query_scalar::<_, i64>(
-        "SELECT least(coalesce(sum(size_bytes), 0), 9223372036854775807)::bigint FROM vault_blobs",
-    )
-    .fetch_one(&state.pool)
-    .await?;
-    let workspaces = sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM organization")
-        .fetch_one(&state.pool)
+    let stored_bytes =
+        sqlx::query_scalar::<_, i64>("SELECT coalesce(sum(size_bytes), 0) FROM vault_blobs")
+            .fetch_one(&state.db.read)
+            .await?;
+    let workspaces = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workspaces")
+        .fetch_one(&state.db.read)
         .await?;
     let default_upload_mb = (settings.default_max_upload_bytes.max(1) as u64)
         .min(state.server_max_upload_bytes)
@@ -678,23 +537,60 @@ pub async fn update_server_settings(
         .saturating_mul(1024 * 1024)
         .min(state.server_max_upload_bytes) as i64;
     sqlx::query(
-        r#"INSERT INTO vault_server_settings
-             (id, registration_enabled, require_approval, default_max_upload_bytes, updated_by_user_id)
-           VALUES (TRUE, $1, $2, $3, $4)
-           ON CONFLICT (id) DO UPDATE SET
-             registration_enabled = EXCLUDED.registration_enabled,
-             require_approval = EXCLUDED.require_approval,
-             default_max_upload_bytes = EXCLUDED.default_max_upload_bytes,
-             updated_by_user_id = EXCLUDED.updated_by_user_id,
-             updated_at = now()"#,
+        r#"UPDATE server_settings SET registration_enabled = ?, require_approval = ?,
+             default_max_upload_bytes = ?, updated_by_user_id = ?, updated_at = ?
+           WHERE id = 1"#,
     )
     .bind(form.registration_enabled.is_some())
     .bind(form.require_approval.is_some())
     .bind(bytes)
     .bind(&session.user.id)
-    .execute(&state.pool)
+    .bind(db::now())
+    .execute(&state.db.write)
     .await?;
     Ok(Redirect::to("/admin?notice=settings"))
+}
+
+/// Downloads a consistent snapshot of the database (`VACUUM INTO`). Uploaded
+/// files are not included; back up the `uploads` folder alongside it.
+pub async fn download_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let session = approved_session(&state, &headers).await?;
+    require_global_admin(&session)?;
+    crate::backup::download(&state).await
+}
+
+/// Shows the outcome of a global-admin command: a notice on success, or the
+/// business-rule refusal on the admin page instead of a JSON body.
+async fn admin_outcome(
+    state: &AppState,
+    session: UserSession,
+    result: AppResult<()>,
+    notice: &str,
+) -> AppResult<Response> {
+    match result {
+        Ok(()) => Ok(Redirect::to(&format!("/admin?notice={notice}")).into_response()),
+        Err(AppError::Validation(message)) => {
+            render_admin(
+                state,
+                session,
+                Some(Notice {
+                    error: true,
+                    text: message,
+                }),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn admin_session(state: &AppState, headers: &HeaderMap) -> AppResult<UserSession> {
+    let session = approved_session(state, headers).await?;
+    require_global_admin(&session)?;
+    Ok(session)
 }
 
 #[derive(Deserialize)]
@@ -711,25 +607,18 @@ pub async fn admin_create_user(
     headers: HeaderMap,
     Form(form): Form<CreateUserForm>,
 ) -> AppResult<Response> {
-    let role = if form.role == "admin" {
-        "admin"
-    } else {
-        "user"
-    };
-    let body = json!({
-        "name": form.name.trim(),
-        "email": form.email.trim(),
-        "password": form.password,
-        "role": role,
-    });
-    admin_bridge_action(
-        &state,
-        &headers,
-        "/internal/admin/create-user",
-        body,
-        "created",
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::create_user(
+        &state.db,
+        &session.user.id,
+        &form.name,
+        &form.email,
+        &form.password,
+        form.role == "admin",
     )
     .await
+    .map(|_| ());
+    admin_outcome(&state, session, result, "created").await
 }
 
 #[derive(Deserialize)]
@@ -743,13 +632,9 @@ pub async fn admin_set_role(
     Path(id): Path<String>,
     Form(form): Form<RoleForm>,
 ) -> AppResult<Response> {
-    let role = if form.role == "admin" {
-        "admin"
-    } else {
-        "user"
-    };
-    let body = json!({"userId": id, "role": role});
-    admin_bridge_action(&state, &headers, "/internal/admin/set-role", body, "role").await
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::set_role(&state.db, &session.user.id, &id, form.role == "admin").await;
+    admin_outcome(&state, session, result, "role").await
 }
 
 pub async fn admin_ban_user(
@@ -757,8 +642,9 @@ pub async fn admin_ban_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    let body = json!({"userId": id, "banned": true});
-    admin_bridge_action(&state, &headers, "/internal/admin/ban", body, "banned").await
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::set_banned(&state.db, &session.user.id, &id, true).await;
+    admin_outcome(&state, session, result, "banned").await
 }
 
 pub async fn admin_unban_user(
@@ -766,8 +652,9 @@ pub async fn admin_unban_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    let body = json!({"userId": id, "banned": false});
-    admin_bridge_action(&state, &headers, "/internal/admin/ban", body, "unbanned").await
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::set_banned(&state.db, &session.user.id, &id, false).await;
+    admin_outcome(&state, session, result, "unbanned").await
 }
 
 pub async fn admin_revoke_sessions(
@@ -775,15 +662,11 @@ pub async fn admin_revoke_sessions(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    let body = json!({"userId": id});
-    admin_bridge_action(
-        &state,
-        &headers,
-        "/internal/admin/revoke-sessions",
-        body,
-        "sessions",
-    )
-    .await
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::revoke_sessions(&state.db, &session.user.id, &id)
+        .await
+        .map(|_| ());
+    admin_outcome(&state, session, result, "sessions").await
 }
 
 #[derive(Deserialize)]
@@ -797,68 +680,16 @@ pub async fn admin_delete_user(
     Path(id): Path<String>,
     Form(form): Form<DeleteUserForm>,
 ) -> AppResult<Response> {
-    let session = approved_session(&state, &headers).await?;
-    require_global_admin(&session)?;
-    let body = json!({
-        "requesterId": &session.user.id,
-        "userId": id,
-        "confirmation": form.confirmation.trim(),
-    });
-    match state
-        .auth
-        .post_json::<_, DeleteWorkspaceResult>("/internal/admin/delete-user", &body, &[])
-        .await
-    {
-        Ok(result) => {
-            api::remove_storage_keys(&state, result.storage_keys).await;
-            Ok(Redirect::to("/admin?notice=deleted").into_response())
-        }
-        Err(AppError::Validation(message)) => {
-            render_admin(
-                &state,
-                session,
-                Some(Notice {
-                    error: true,
-                    text: message,
-                }),
-            )
-            .await
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::delete_user(&state.db, &session.user.id, &id, &form.confirmation).await;
+    let result = match result {
+        Ok(storage_keys) => {
+            api::remove_storage_keys(&state, storage_keys).await;
+            Ok(())
         }
         Err(error) => Err(error),
-    }
-}
-
-/// Runs one global-admin command on the auth bridge. Business-rule refusals come
-/// back as validation errors and are shown on the admin page instead of a JSON body.
-async fn admin_bridge_action(
-    state: &AppState,
-    headers: &HeaderMap,
-    path: &str,
-    mut body: serde_json::Value,
-    notice: &str,
-) -> AppResult<Response> {
-    let session = approved_session(state, headers).await?;
-    require_global_admin(&session)?;
-    body["requesterId"] = json!(&session.user.id);
-    match state
-        .auth
-        .post_json::<_, serde_json::Value>(path, &body, &[])
-        .await
-    {
-        Ok(_) => Ok(Redirect::to(&format!("/admin?notice={notice}")).into_response()),
-        Err(AppError::Validation(message)) => {
-            render_admin(
-                state,
-                session,
-                Some(Notice {
-                    error: true,
-                    text: message,
-                }),
-            )
-            .await
-        }
-        Err(error) => Err(error),
-    }
+    };
+    admin_outcome(&state, session, result, "deleted").await
 }
 
 pub async fn reset_password(
@@ -874,16 +705,17 @@ pub async fn join(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> AppResult<Html<String>> {
-    let hash = token_hash(&token);
     let valid = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM vault_invitations WHERE token_hash = $1 AND redeemed_at IS NULL AND expires_at > now())",
-    ).bind(hash).fetch_one(&state.pool).await?;
+        "SELECT EXISTS(SELECT 1 FROM vault_invitations WHERE token_hash = ? AND redeemed_at IS NULL AND expires_at > ?)",
+    )
+    .bind(token_hash(&token))
+    .bind(db::now())
+    .fetch_one(&state.db.read)
+    .await?;
     if !valid {
         return Err(AppError::NotFound);
     }
-    let signed_in = state
-        .auth
-        .session(&headers, workspace_cookie(&headers))
+    let signed_in = auth::session(&state, &headers)
         .await
         .map(|session| session.user.approval_status == "approved")
         .unwrap_or(false);
@@ -899,29 +731,22 @@ pub async fn switch_workspace(
     headers: HeaderMap,
     Form(form): Form<SwitchForm>,
 ) -> AppResult<Response> {
-    let session = state
-        .auth
-        .session(&headers, Some(&form.organization_id))
-        .await?;
+    let session =
+        identity::session_from_headers(&state.db, &headers, Some(&form.organization_id)).await?;
     if session.user.approval_status != "approved"
         || session.active_organization_id.as_deref() != Some(&form.organization_id)
     {
         return Err(AppError::Forbidden);
     }
-    let secure = if state.public_base_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "vault_workspace={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{}",
-        form.organization_id, secure
+    let cookie = identity::set_cookie(
+        identity::WORKSPACE_COOKIE,
+        &form.organization_id,
+        31_536_000,
+        state.secure_cookies,
+        "/",
     );
     let mut response = Redirect::to("/").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        cookie.parse().map_err(|_| AppError::Forbidden)?,
-    );
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
     Ok(response)
 }
 
@@ -940,17 +765,25 @@ pub async fn update_workspace_settings(
     let requested = form.max_upload_mb.max(1).saturating_mul(1024 * 1024);
     let limit = requested.min(state.server_max_upload_bytes) as i64;
     sqlx::query(
-        r#"INSERT INTO vault_workspace_settings (organization_id, max_upload_bytes, updated_by_user_id)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (organization_id) DO UPDATE SET max_upload_bytes = EXCLUDED.max_upload_bytes,
-           updated_by_user_id = EXCLUDED.updated_by_user_id, updated_at = now()"#,
+        r#"INSERT INTO vault_workspace_settings (organization_id, max_upload_bytes, updated_by_user_id, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (organization_id) DO UPDATE SET max_upload_bytes = excluded.max_upload_bytes,
+           updated_by_user_id = excluded.updated_by_user_id, updated_at = excluded.updated_at"#,
     )
     .bind(organization_id)
     .bind(limit)
     .bind(session.user.id)
-    .execute(&state.pool)
+    .bind(db::now())
+    .execute(&state.db.write)
     .await?;
     Ok(Redirect::to("/keys"))
+}
+
+fn active_workspace(session: &UserSession) -> AppResult<&str> {
+    session
+        .active_organization_id
+        .as_deref()
+        .ok_or(AppError::Forbidden)
 }
 
 #[derive(Deserialize)]
@@ -965,11 +798,14 @@ pub async fn update_member_role(
 ) -> AppResult<Redirect> {
     let session = approved_session(&state, &headers).await?;
     require_workspace_manager(&session)?;
-    let body = workspace_member_body(&session, &id, Some(&form.role))?;
-    let _: OkResult = state
-        .auth
-        .post_json("/internal/workspaces/member-role", &body, &[])
-        .await?;
+    workspaces::set_member_role(
+        &state.db,
+        active_workspace(&session)?,
+        &session.user.id,
+        &id,
+        &form.role,
+    )
+    .await?;
     Ok(Redirect::to("/keys"))
 }
 
@@ -980,11 +816,13 @@ pub async fn remove_member(
 ) -> AppResult<Redirect> {
     let session = approved_session(&state, &headers).await?;
     require_workspace_manager(&session)?;
-    let body = workspace_member_body(&session, &id, None)?;
-    let _: OkResult = state
-        .auth
-        .post_json("/internal/workspaces/remove-member", &body, &[])
-        .await?;
+    workspaces::remove_member(
+        &state.db,
+        active_workspace(&session)?,
+        &session.user.id,
+        &id,
+    )
+    .await?;
     Ok(Redirect::to("/keys"))
 }
 
@@ -997,11 +835,13 @@ pub async fn transfer_ownership(
     if session.active_role.as_deref() != Some("owner") {
         return Err(AppError::Forbidden);
     }
-    let body = workspace_member_body(&session, &id, None)?;
-    let _: OkResult = state
-        .auth
-        .post_json("/internal/workspaces/transfer", &body, &[])
-        .await?;
+    workspaces::transfer(
+        &state.db,
+        active_workspace(&session)?,
+        &session.user.id,
+        &id,
+    )
+    .await?;
     Ok(Redirect::to("/keys"))
 }
 
@@ -1018,59 +858,20 @@ pub async fn delete_workspace(
     if session.active_role.as_deref() != Some("owner") {
         return Err(AppError::Forbidden);
     }
-    let organization_id = session.active_organization_id.ok_or(AppError::Forbidden)?;
-    let temp_storage_keys = sqlx::query_scalar::<_, String>(
-        "SELECT temp_storage_key FROM vault_upload_sessions WHERE organization_id=$1",
+    let storage_keys = workspaces::delete(
+        &state.db,
+        active_workspace(&session)?,
+        &session.user.id,
+        &form.confirmation,
     )
-    .bind(&organization_id)
-    .fetch_all(&state.pool)
     .await?;
-    let body = json!({
-        "organizationId": organization_id,
-        "requesterId": &session.user.id,
-        "confirmation": form.confirmation,
-    });
-    let result: DeleteWorkspaceResult = state
-        .auth
-        .post_json("/internal/workspaces/delete", &body, &[])
-        .await?;
-    api::remove_storage_keys(
-        &state,
-        result
-            .storage_keys
-            .into_iter()
-            .chain(temp_storage_keys)
-            .collect(),
-    )
-    .await;
+    api::remove_storage_keys(&state, storage_keys).await;
     let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        "vault_workspace=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
-            .parse()
-            .map_err(|_| AppError::Forbidden)?,
+        identity::set_cookie(identity::WORKSPACE_COOKIE, "", 0, state.secure_cookies, "/"),
     );
     Ok(response)
-}
-
-fn workspace_member_body(
-    session: &BridgeSession,
-    user_id: &str,
-    role: Option<&str>,
-) -> AppResult<serde_json::Value> {
-    let organization_id = session
-        .active_organization_id
-        .as_deref()
-        .ok_or(AppError::Forbidden)?;
-    let mut body = json!({
-        "organizationId": organization_id,
-        "requesterId": &session.user.id,
-        "userId": user_id,
-    });
-    if let Some(role) = role {
-        body["role"] = json!(role);
-    }
-    Ok(body)
 }
 
 #[derive(Deserialize)]
@@ -1086,7 +887,7 @@ pub async fn capture_text(
     headers: HeaderMap,
     Form(form): Form<CaptureForm>,
 ) -> AppResult<Response> {
-    let auth = crate::auth::authorize(&state.auth, &headers, "items:write").await?;
+    let auth = auth::authorize(&state, &headers, "items:write").await?;
     let input = ItemCreate {
         payload: form.payload,
         kind: form.kind,
@@ -1119,10 +920,7 @@ pub async fn create_key(
     Form(form): Form<KeyForm>,
 ) -> AppResult<Html<String>> {
     let session = approved_session(&state, &headers).await?;
-    let organization_id = session
-        .active_organization_id
-        .clone()
-        .ok_or(AppError::Forbidden)?;
+    let organization_id = active_workspace(&session)?;
     let mut permissions = vec!["items:write"];
     if form.read.is_some() {
         permissions.push("items:read");
@@ -1130,17 +928,18 @@ pub async fn create_key(
     if form.delete.is_some() {
         permissions.push("items:delete");
     }
-    let body = json!({
-        "organizationId": organization_id, "requesterId": session.user.id,
-        "name": &form.name, "expiresInDays": form.expires_in_days.clamp(1, 3650), "permissions": permissions,
-    });
-    let result: SecretResult = state
-        .auth
-        .post_json("/internal/api-keys", &body, &[])
-        .await?;
+    let secret = keys::create(
+        &state.db,
+        organization_id,
+        &session.user.id,
+        &form.name,
+        form.expires_in_days,
+        &permissions,
+    )
+    .await?;
     render(ApiKeyCreatedTemplate {
         name: form.name.trim().chars().take(80).collect(),
-        secret: result.secret,
+        secret,
         server_url: state.public_base_url.to_string(),
         can_read: form.read.is_some(),
         can_delete: form.delete.is_some(),
@@ -1153,14 +952,13 @@ pub async fn revoke_key(
     Path(id): Path<String>,
 ) -> AppResult<Redirect> {
     let session = approved_session(&state, &headers).await?;
-    let organization_id = session.active_organization_id.ok_or(AppError::Forbidden)?;
-    let path = format!(
-        "/internal/api-keys/{}?organizationId={}&requesterId={}",
-        urlencoding(&id),
-        urlencoding(&organization_id),
-        urlencoding(&session.user.id)
-    );
-    let _: OkResult = state.auth.delete_json(&path, &[]).await?;
+    keys::revoke(
+        &state.db,
+        active_workspace(&session)?,
+        &session.user.id,
+        &id,
+    )
+    .await?;
     Ok(Redirect::to("/keys"))
 }
 
@@ -1174,7 +972,7 @@ pub async fn create_invitation(
     Form(form): Form<InviteForm>,
 ) -> AppResult<Html<String>> {
     let session = approved_session(&state, &headers).await?;
-    let organization_id = session.active_organization_id.ok_or(AppError::Forbidden)?;
+    let organization_id = active_workspace(&session)?.to_owned();
     let role = match form.role.as_str() {
         "admin" => "admin",
         _ => "member",
@@ -1184,10 +982,19 @@ pub async fn create_invitation(
         return Err(AppError::Forbidden);
     }
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let now = Utc::now();
     sqlx::query(
-        "INSERT INTO vault_invitations (organization_id, token_hash, role, created_by_user_id, expires_at) VALUES ($1,$2,$3,$4,$5)",
-    ).bind(&organization_id).bind(token_hash(&token)).bind(role).bind(&session.user.id)
-        .bind(Utc::now() + Duration::hours(48)).execute(&state.pool).await?;
+        "INSERT INTO vault_invitations (id, organization_id, token_hash, role, created_by_user_id, expires_at, created_at) VALUES (?,?,?,?,?,?,?)",
+    )
+    .bind(Uuid::new_v4().hyphenated())
+    .bind(&organization_id)
+    .bind(token_hash(&token))
+    .bind(role)
+    .bind(&session.user.id)
+    .bind(db::ts(now + Duration::hours(48)))
+    .bind(db::ts(now))
+    .execute(&state.db.write)
+    .await?;
     let url = format!("{}/join/{}", state.public_base_url, token);
     render(OneTimeSecretTemplate {
         title: "Invitation created".into(),
@@ -1203,20 +1010,23 @@ pub async fn redeem_invite(
     Path(token): Path<String>,
 ) -> AppResult<Redirect> {
     let session = approved_session(&state, &headers).await?;
-    let mut tx = state.pool.begin().await?;
-    let row = sqlx::query_as::<_, (Uuid, String, String)>(
-        "SELECT id, organization_id, role FROM vault_invitations WHERE token_hash = $1 AND redeemed_at IS NULL AND expires_at > now() FOR UPDATE",
-    ).bind(token_hash(&token)).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
-    let body = json!({"organizationId": row.1, "userId": session.user.id, "role": row.2});
-    let _: OkResult = state
-        .auth
-        .post_json("/internal/workspaces/join", &body, &[])
-        .await?;
-    sqlx::query(
-        "UPDATE vault_invitations SET redeemed_at = now(), redeemed_by_user_id = $2 WHERE id = $1",
+    let mut tx = state.db.begin().await?;
+    let now = db::now();
+    let (id, organization_id, role) = sqlx::query_as::<_, (Id, String, String)>(
+        "SELECT id, organization_id, role FROM vault_invitations WHERE token_hash = ? AND redeemed_at IS NULL AND expires_at > ?",
     )
-    .bind(row.0)
+    .bind(token_hash(&token))
+    .bind(&now)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    workspaces::join(&mut tx, &organization_id, &session.user.id, &role).await?;
+    sqlx::query(
+        "UPDATE vault_invitations SET redeemed_at = ?, redeemed_by_user_id = ? WHERE id = ?",
+    )
+    .bind(&now)
     .bind(&session.user.id)
+    .bind(id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1228,31 +1038,19 @@ pub async fn approve_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Redirect> {
-    admin_mutation(&state, &headers, &id, "approve").await?;
+    let session = admin_session(&state, &headers).await?;
+    accounts::approve(&state.db, &session.user.id, &id).await?;
     Ok(Redirect::to("/admin?notice=approved"))
 }
+
 pub async fn reject_user(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> AppResult<Redirect> {
-    admin_mutation(&state, &headers, &id, "reject").await?;
-    Ok(Redirect::to("/admin?notice=rejected"))
-}
-async fn admin_mutation(
-    state: &AppState,
-    headers: &HeaderMap,
-    id: &str,
-    action: &str,
-) -> AppResult<()> {
-    let session = approved_session(state, headers).await?;
-    require_global_admin(&session)?;
-    let body = json!({"requesterId": session.user.id, "userId": id});
-    let _: OkResult = state
-        .auth
-        .post_json(&format!("/internal/admin/{action}"), &body, &[])
-        .await?;
-    Ok(())
+) -> AppResult<Response> {
+    let session = admin_session(&state, &headers).await?;
+    let result = accounts::reject(&state.db, &session.user.id, &id).await;
+    admin_outcome(&state, session, result, "rejected").await
 }
 
 pub async fn manual_reset(
@@ -1260,18 +1058,16 @@ pub async fn manual_reset(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Html<String>> {
-    let session = approved_session(&state, &headers).await?;
-    require_global_admin(&session)?;
-    let body = json!({"requesterId": session.user.id, "userId": id});
-    let result: UrlResult = state
-        .auth
-        .post_json("/internal/admin/reset-link", &body, &[])
-        .await?;
+    let session = admin_session(&state, &headers).await?;
+    let url =
+        accounts::reset_link(&state.db, &state.public_base_url, &session.user.id, &id).await?;
     render(OneTimeSecretTemplate {
         title: "Password reset link".into(),
-        description: "Send this private link to the user. It expires shortly and works once."
-            .into(),
-        secret: result.url,
+        description: format!(
+            "Send this private link to the user. It expires in {} minutes and works once.",
+            accounts::RESET_LINK_MINUTES
+        ),
+        secret: url,
         back_url: "/admin".into(),
     })
 }
@@ -1283,24 +1079,21 @@ pub async fn not_found() -> impl IntoResponse {
     )
 }
 
-async fn approved_session(state: &AppState, headers: &HeaderMap) -> AppResult<BridgeSession> {
-    let session = state
-        .auth
-        .session(headers, workspace_cookie(headers))
-        .await?;
+async fn approved_session(state: &AppState, headers: &HeaderMap) -> AppResult<UserSession> {
+    let session = auth::session(state, headers).await?;
     if session.user.approval_status != "approved" {
         return Err(AppError::PendingApproval);
     }
     Ok(session)
 }
-fn require_global_admin(session: &BridgeSession) -> AppResult<()> {
-    if session.user.role.split(',').any(|role| role == "admin") {
+fn require_global_admin(session: &UserSession) -> AppResult<()> {
+    if identity::is_admin_role(&session.user.role) {
         Ok(())
     } else {
         Err(AppError::Forbidden)
     }
 }
-fn require_workspace_manager(session: &BridgeSession) -> AppResult<()> {
+fn require_workspace_manager(session: &UserSession) -> AppResult<()> {
     if matches!(session.active_role.as_deref(), Some("owner" | "admin")) {
         Ok(())
     } else {

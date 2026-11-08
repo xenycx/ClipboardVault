@@ -15,18 +15,6 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
-
-  auth:
-    runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:17-alpine
@@ -41,30 +29,17 @@ jobs:
           --health-timeout 3s
           --health-retries 30
     env:
-      DATABASE_URL: postgresql://vault:vault-ci-password@127.0.0.1:5432/clipboard_vault
-      BETTER_AUTH_SECRET: auth-ci-secret-with-at-least-32-bytes
-    defaults:
-      run:
-        working-directory: auth
+      # Seeded with the archived 2.x schema by tests/import_postgres.rs.
+      IMPORT_TEST_DATABASE_URL: postgresql://vault:vault-ci-password@127.0.0.1:5432/clipboard_vault
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          version: 11.9.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: auth/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test
-      - run: pnpm build
-      - name: Confirm Better Auth schema has no delta
-        run: |
-          docker exec -i ${{ job.services.postgres.id }} psql -U vault -d clipboard_vault < migrations/auth-schema.sql
-          rm -f migrations/generated.sql
-          pnpm auth:generate
-          test ! -s migrations/generated.sql
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
 
   contracts:
     runs-on: ubuntu-latest
@@ -80,7 +55,7 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
-    needs: [rust, auth, contracts]
+    needs: [rust, contracts]
     env:
       COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
     steps:
@@ -107,23 +82,15 @@ jobs:
           sed -i 's|GITHUB_CLIENT_SECRET=|GITHUB_CLIENT_SECRET=github-ci-secret|' .env
           sed -i 's|DISCORD_CLIENT_ID=|DISCORD_CLIENT_ID=discord-ci-client|' .env
           sed -i 's|DISCORD_CLIENT_SECRET=|DISCORD_CLIENT_SECRET=discord-ci-secret|' .env
-      - name: Build and load Rust image
+      - name: Build and load the image
         uses: docker/build-push-action@v6
         with:
           context: .
           load: true
           tags: clipboard-vault:local
-          cache-from: type=gha,scope=clipboard-vault-rust
-          cache-to: type=gha,mode=max,scope=clipboard-vault-rust
-      - name: Build and load auth image
-        uses: docker/build-push-action@v6
-        with:
-          context: auth
-          load: true
-          tags: clipboard-vault-auth:local
-          cache-from: type=gha,scope=clipboard-vault-auth
-          cache-to: type=gha,mode=max,scope=clipboard-vault-auth
-      - name: Start the exact images under test
+          cache-from: type=gha,scope=clipboard-vault
+          cache-to: type=gha,mode=max,scope=clipboard-vault
+      - name: Start the exact image under test
         run: docker compose up -d --no-build
       - name: Wait for readiness
         run: |
@@ -151,12 +118,16 @@ jobs:
           curl -fsS -b cookies.txt -H 'Origin: http://localhost' -H 'Content-Type: application/json' \
             -d '{"token":"replace-with-at-least-32-random-bytes"}' \
             http://localhost/api/auth/vault/bootstrap
-          user_id=$(docker compose exec -T postgres psql -U vault -d clipboard_vault -Atc "SELECT id FROM \"user\" WHERE email='ci@example.test'")
-          organization_id=$(docker compose exec -T postgres psql -U vault -d clipboard_vault -Atc "SELECT \"organizationId\" FROM member WHERE \"userId\"='$user_id' LIMIT 1")
-          key_json=$(docker compose exec -T -e TEST_USER_ID="$user_id" -e TEST_ORG_ID="$organization_id" auth node -e \
-            'fetch("http://127.0.0.1:3001/internal/api-keys", {method:"POST", headers:{"content-type":"application/json","x-auth-bridge-secret":process.env.AUTH_BRIDGE_SECRET}, body:JSON.stringify({organizationId:process.env.TEST_ORG_ID,requesterId:process.env.TEST_USER_ID,name:"CI uploader",expiresInDays:1,permissions:["items:write","items:read","items:delete"]})}).then(async r=>{const text=await r.text();if(!r.ok)throw new Error(text);process.stdout.write(text)})')
-          echo "$key_json" | jq -r '.data.secret' > api-key.txt
+          curl -fsS -b cookies.txt -H 'Origin: http://localhost' \
+            --data-urlencode 'name=CI uploader' -d expires_in_days=1 -d read=on -d delete=on \
+            http://localhost/keys/create | grep -o 'cv_live_[A-Za-z]\{64\}' | head -n 1 > api-key.txt
           test -s api-key.txt
+          # The internal bridge no longer exists anywhere.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/internal/session)" = 404
+      - name: Check a database snapshot can be downloaded
+        run: |
+          curl -fsS -b cookies.txt -o snapshot.db http://localhost/admin/backup
+          head -c 15 snapshot.db | grep -q 'SQLite format 3'
       - name: Run Python uploader end to end
         run: |
           python -m pip install requests

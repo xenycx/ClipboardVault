@@ -15,7 +15,7 @@ if [ -z "${DOMAIN:-}" ]; then
   exit 1
 fi
 
-docker compose up -d postgres auth vault nginx
+docker compose up -d vault nginx
 docker compose --profile certificates run --rm certbot certonly \
   --webroot --webroot-path /var/www/certbot \
   --domain "$DOMAIN" \

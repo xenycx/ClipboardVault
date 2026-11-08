@@ -1,4 +1,9 @@
 #!/usr/bin/env sh
+# In-place upgrades between Clipboard Vault 3.x releases (Compose installs).
+#
+# Moving from 2.x (PostgreSQL + auth service) to 3.0 is NOT an in-place upgrade:
+# it needs the one-time import described in DEPLOYMENT.md. This script refuses to
+# run against a 2.x stack.
 set -eu
 
 say() { printf '%s\n' "[clipboard-vault] $*"; }
@@ -19,10 +24,8 @@ fi
 REPO_ROOT=${CLIPBOARD_VAULT_REPO_ROOT:?missing repository root}
 cd "$REPO_ROOT"
 STATE_DIRECTORY="$REPO_ROOT/.deployment"
-BACKUP_DIRECTORY="$REPO_ROOT/backups"
 STATE_FILE="$STATE_DIRECTORY/last-success.env"
 PENDING_STATE_FILE="$STATE_DIRECTORY/pending.env"
-AUTH_IMAGE="clipboard-vault-auth:local"
 VAULT_IMAGE="clipboard-vault:local"
 
 usage() {
@@ -97,6 +100,8 @@ load_environment() {
   check_pair GitHub "${GITHUB_CLIENT_ID:-}" "${GITHUB_CLIENT_SECRET:-}" GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET
   check_pair Discord "${DISCORD_CLIENT_ID:-}" "${DISCORD_CLIENT_SECRET:-}" DISCORD_CLIENT_ID DISCORD_CLIENT_SECRET
   [ -n "${PUBLIC_BASE_URL:-}" ] || fail "PUBLIC_BASE_URL is missing from .env"
+  [ -n "${VAULT_SECRET:-}" ] || fail "VAULT_SECRET is missing from .env (3.x replaced the 2.x secrets)"
+  [ -n "${SETUP_TOKEN:-}" ] || fail "SETUP_TOKEN is missing from .env (it replaces BOOTSTRAP_TOKEN)"
 }
 
 check_versions() {
@@ -125,11 +130,17 @@ check_disk_reserve() {
   [ "$available_bytes" -gt "$reserve" ] || fail "Docker storage has $available_bytes bytes free; more than the $reserve-byte reserve is required"
 }
 
-check_database() {
-  postgres_container=$(compose ps --status running -q postgres)
-  [ -n "$postgres_container" ] || fail "PostgreSQL is not running"
-  compose exec -T postgres pg_isready \
-    -U "${POSTGRES_USER:-vault}" -d "${POSTGRES_DB:-clipboard_vault}" >/dev/null || fail "PostgreSQL is not ready"
+check_not_2x() {
+  # A running 2.x stack has separate PostgreSQL and auth containers.
+  if [ -n "$(docker ps -q --filter 'label=com.docker.compose.project=clipboard-vault' --filter 'label=com.docker.compose.service=postgres')" ] ||
+     [ -n "$(docker ps -q --filter 'label=com.docker.compose.project=clipboard-vault' --filter 'label=com.docker.compose.service=auth')" ]; then
+    fail "this host runs Clipboard Vault 2.x; follow 'Moving from 2.x to 3.0' in DEPLOYMENT.md instead"
+  fi
+}
+
+check_service() {
+  vault_container=$(compose ps --status running -q vault)
+  [ -n "$vault_container" ] || fail "the vault service is not running"
 }
 
 resolve_ref() {
@@ -162,16 +173,17 @@ preflight() {
   check_clean_checkout
   load_environment
   check_versions
+  check_not_2x
   compose config --quiet
   check_disk_reserve
-  check_database
+  check_service
 }
 
 wait_for_readiness() {
   attempt=1
   while [ "$attempt" -le 60 ]; do
-    if compose exec -T auth wget -q -O - http://127.0.0.1:3001/health >/dev/null 2>&1 \
-      && compose exec -T vault curl -fsS http://127.0.0.1:8080/health/ready >/dev/null 2>&1 \
+    # The runtime image has no shell or curl: the binary checks itself.
+    if compose exec -T vault /usr/local/bin/clipboard-vault healthcheck >/dev/null 2>&1 \
       && curl -fsS "${PUBLIC_BASE_URL%/}/health/ready" >/dev/null 2>&1; then
       return 0
     fi
@@ -185,30 +197,25 @@ write_state() {
   destination=$1
   previous_commit_value=$2
   deployed_commit_value=$3
-  auth_tag_value=$4
-  vault_tag_value=$5
-  backup_value=$6
+  vault_tag_value=$4
+  snapshot_value=$5
   umask 077
   {
     printf "previous_commit='%s'\n" "$previous_commit_value"
     printf "deployed_commit='%s'\n" "$deployed_commit_value"
-    printf "auth_rollback_tag='%s'\n" "$auth_tag_value"
     printf "vault_rollback_tag='%s'\n" "$vault_tag_value"
-    printf "database_backup='%s'\n" "$backup_value"
+    printf "database_snapshot='%s'\n" "$snapshot_value"
   } > "$destination"
 }
 
-restore_images() {
+restore_image() {
   previous_commit_value=$1
-  auth_tag_value=$2
-  vault_tag_value=$3
-  say "Restoring the previous application images"
-  docker image inspect "$auth_tag_value" >/dev/null 2>&1 || fail "rollback auth image $auth_tag_value is unavailable"
-  docker image inspect "$vault_tag_value" >/dev/null 2>&1 || fail "rollback vault image $vault_tag_value is unavailable"
-  docker image tag "$auth_tag_value" "$AUTH_IMAGE"
+  vault_tag_value=$2
+  say "Restoring the previous application image"
+  docker image inspect "$vault_tag_value" >/dev/null 2>&1 || fail "rollback image $vault_tag_value is unavailable"
   docker image tag "$vault_tag_value" "$VAULT_IMAGE"
-  compose up -d --no-build --force-recreate --wait --wait-timeout 120 auth vault
-  wait_for_readiness || fail "the previous images were restored but readiness verification failed"
+  compose up -d --no-build --force-recreate --wait --wait-timeout 120 vault
+  wait_for_readiness || fail "the previous image was restored but readiness verification failed"
   git checkout --detach "$previous_commit_value"
   say "Rollback is healthy at commit $previous_commit_value"
 }
@@ -219,10 +226,9 @@ if [ "$MODE" = "rollback" ]; then
   # shellcheck disable=SC1090
   . "$STATE_FILE"
   [ -n "${previous_commit:-}" ] || fail "rollback state has no previous commit"
-  [ -n "${auth_rollback_tag:-}" ] || fail "rollback state has no auth image"
   [ -n "${vault_rollback_tag:-}" ] || fail "rollback state has no vault image"
-  restore_images "$previous_commit" "$auth_rollback_tag" "$vault_rollback_tag"
-  say "Database backup retained at ${database_backup:-unknown}; database rows were not rewound"
+  restore_image "$previous_commit" "$vault_rollback_tag"
+  say "Database rows were not rewound. The pre-upgrade snapshot is ${database_snapshot:-unknown} inside the data volume"
   exit 0
 fi
 
@@ -231,65 +237,57 @@ target_commit=$(resolve_ref "$REF")
 check_target_compose "$target_commit"
 say "Preflight passed for $REF ($target_commit)"
 if [ "$MODE" = "check" ]; then
-  say "No deployment files, containers, images, or database data were changed"
+  say "No deployment files, containers, images, or data were changed"
   exit 0
 fi
 
-mkdir -p "$STATE_DIRECTORY" "$BACKUP_DIRECTORY"
-chmod 700 "$STATE_DIRECTORY" "$BACKUP_DIRECTORY"
+mkdir -p "$STATE_DIRECTORY"
+chmod 700 "$STATE_DIRECTORY"
 previous_commit=$(git rev-parse HEAD)
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-auth_container=$(compose ps -q auth)
 vault_container=$(compose ps -q vault)
-[ -n "$auth_container" ] || fail "the current auth container is unavailable"
 [ -n "$vault_container" ] || fail "the current vault container is unavailable"
-auth_image_id=$(docker inspect --format '{{.Image}}' "$auth_container")
 vault_image_id=$(docker inspect --format '{{.Image}}' "$vault_container")
-auth_rollback_tag="clipboard-vault-auth:rollback-$timestamp"
 vault_rollback_tag="clipboard-vault:rollback-$timestamp"
-database_backup="$BACKUP_DIRECTORY/postgres-$timestamp.dump"
+database_snapshot="/data/backups/pre-upgrade-$timestamp.db"
 
-say "Creating compressed PostgreSQL backup"
-umask 077
-compose exec -T postgres pg_dump -Fc --no-owner --no-acl \
-  -U "${POSTGRES_USER:-vault}" -d "${POSTGRES_DB:-clipboard_vault}" > "$database_backup"
-[ -s "$database_backup" ] || fail "the PostgreSQL backup is empty"
-docker image tag "$auth_image_id" "$auth_rollback_tag"
+say "Writing a consistent database snapshot to $database_snapshot (inside the data volume)"
+compose exec -T vault /usr/local/bin/clipboard-vault backup "$database_snapshot" ||
+  fail "the database snapshot failed; nothing was changed"
 docker image tag "$vault_image_id" "$vault_rollback_tag"
 write_state "$PENDING_STATE_FILE" "$previous_commit" "$target_commit" \
-  "$auth_rollback_tag" "$vault_rollback_tag" "$database_backup"
+  "$vault_rollback_tag" "$database_snapshot"
 
 say "Checking out exact commit $target_commit"
 git checkout --detach "$target_commit"
 if ! compose config --quiet; then
   git checkout --detach "$previous_commit"
-  fail "the target Compose configuration is invalid; the previous containers are still running"
+  fail "the target Compose configuration is invalid; the previous container is still running"
 fi
 
-say "Building auth and vault while the current containers keep serving"
+say "Building the new image while the current container keeps serving"
+build_status=0
 if [ "$MODE" = "refresh" ]; then
-  build_status=0
-  compose build --pull auth vault || build_status=$?
+  compose build --pull vault || build_status=$?
 else
-  build_status=0
-  compose build auth vault || build_status=$?
+  compose build vault || build_status=$?
 fi
 if [ "$build_status" -ne 0 ]; then
   git checkout --detach "$previous_commit"
-  fail "build failed; the previous containers are still running and the backup is at $database_backup"
+  fail "build failed; the previous container is still running and the snapshot is at $database_snapshot"
 fi
 
-say "Starting the newly built auth and vault services"
+say "Starting the newly built service"
 startup_status=0
-compose up -d --no-build --wait --wait-timeout 120 auth vault || startup_status=$?
+compose up -d --no-build --wait --wait-timeout 120 vault || startup_status=$?
 if [ "$startup_status" -ne 0 ] || ! wait_for_readiness; then
-  say "New services failed readiness; beginning automatic rollback"
-  restore_images "$previous_commit" "$auth_rollback_tag" "$vault_rollback_tag"
-  fail "upgrade failed and the previous deployment was restored; backup retained at $database_backup"
+  say "The new service failed readiness; beginning automatic rollback"
+  restore_image "$previous_commit" "$vault_rollback_tag"
+  fail "upgrade failed and the previous deployment was restored; snapshot retained at $database_snapshot"
 fi
 
 write_state "$STATE_FILE" "$previous_commit" "$target_commit" \
-  "$auth_rollback_tag" "$vault_rollback_tag" "$database_backup"
+  "$vault_rollback_tag" "$database_snapshot"
 rm -f "$PENDING_STATE_FILE"
 say "Upgrade complete at $target_commit"
-say "Rollback images and database backup retained; Nginx stayed running throughout"
+say "Rollback image and database snapshot retained; Nginx stayed running throughout"

@@ -32,8 +32,8 @@ pub enum AppError {
     PreviewUnavailable,
     #[error("the requested byte range is not satisfiable")]
     RangeNotSatisfiable { size: u64 },
-    #[error("authentication service is unavailable")]
-    AuthUnavailable,
+    #[error("too many requests; try again in a minute")]
+    RateLimited,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -80,11 +80,7 @@ impl IntoResponse for AppError {
                 "RANGE_NOT_SATISFIABLE",
                 json!({"size": size}),
             ),
-            Self::AuthUnavailable => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "AUTH_UNAVAILABLE",
-                json!({}),
-            ),
+            Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED", json!({})),
             Self::Multipart(error) => (error.status(), "MULTIPART_ERROR", json!({})),
             Self::Database(_) | Self::Io(_) | Self::Other(_) => {
                 error!(error = %self, "request failed");
