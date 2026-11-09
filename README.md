@@ -307,13 +307,53 @@ the whole trash. Both need the `items:delete` permission.
 
 ### Python client (no dependencies)
 
-`static/vault.py` is a single-file command-line client that uses only the Python standard
-library (3.8+). Creating a key in the browser offers a copy with the server address and the
-new key filled in; **Keys and team** also links a blank copy that reads `VAULT_SERVER` and
-`VAULT_API_KEY` from the environment. It is unchanged in 3.0.
+`static/vault.py` is a single-file client that uses only the Python standard library (3.8+).
+Creating a key in the browser offers a copy with the server address and the new key filled in;
+**Keys and team** also links a blank copy that asks for them the first time it runs.
+
+**Full-screen interface.** Run it with no arguments, or double-click it on Windows:
+
+```bash
+python vault.py
+```
+
+* **Browse the vault**: page through everything (Left/Right), search (`/`), filter by type
+  (`t`), open an item to read its full text, select several items (Space, `a` for the page; the
+  selection survives page changes) and download them (`d`) with live progress. `x` moves items to
+  the trash; `Tab` switches to the trash, where `r` restores and `p` deletes for good.
+* **Upload files**: a file browser. Space selects a file or a whole folder, selections are kept
+  while you move between folders, `g` jumps to any typed or pasted path, `p` lists drives and
+  recent places, `/` filters the current folder. Folders can be uploaded with their sub-folder
+  structure. Uploads run in parallel, report per-file progress, and can be cancelled with Esc
+  (large files resume the next time you upload them).
+* **New text note**, **Storage**, and **Settings** (server, key, download folder, parallel transfers).
+
+If the window closes too quickly after an error on Windows, nothing is lost: with no arguments the
+script waits for Enter before closing when something went wrong.
+
+**Network folders (UNC).** The script can live on a share such as `\\fileserver\tools\vault.py` and
+be started by double-click from there. It never relies on the current directory (Windows
+replaces a UNC working directory with `C:\Windows`), keeps its settings in your user profile, and
+accepts `\\server\share\folder` paths for uploads and downloads (also with the quotes that
+Explorer's "Copy as path" adds). Paths longer than 260 characters are handled. Access uses your
+signed-in Windows account; if a share needs other credentials, connect to it first
+(`net use \\server\share`). On Windows the interface needs Windows 10 or newer (any console, including
+Windows Terminal).
+
+**Where the key lives.** The first run asks for the server address and an API key and saves them in
+`%APPDATA%\ClipboardVault\config.json` (`~/.config/clipboard-vault/config.json` elsewhere; set
+`VAULT_CONFIG` to move it). Use the **blank** copy of the script on a shared folder: the
+personalised copy from the key-created page has the key written inside it, so everyone who can read the
+file can use the key.
+
+Priority, highest first: `--server`/`--key`, `VAULT_SERVER`/`VAULT_API_KEY`, saved settings,
+the values written into the script.
+
+**Commands** (unchanged, for scripts):
 
 ```bash
 python vault.py up report.pdf screenshots/        # parallel, resumable uploads of any size
+python vault.py up photos/ --keep-structure -f /trips   # recreate sub-folders in the vault
 python vault.py ls invoice                        # search
 python vault.py get 3f2a9c1e -o ~/Downloads        # resumable download (IDs can be shortened)
 git diff | python vault.py paste --tag diff       # save text from stdin
@@ -322,7 +362,9 @@ python vault.py rm 3f2a9c1e && python vault.py empty-trash --yes
 ```
 
 Files up to 90 MiB stream through one multipart request; larger files (or `--resumable`)
-use Tus and resume automatically when the command is run again.
+use Tus and resume automatically when the command is run again. `get` without `-o` saves into the
+current folder, or into your Downloads folder when the current folder is not usable. Hidden
+files and folders are skipped when a folder is uploaded.
 
 ### Older Python examples
 

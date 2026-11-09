@@ -177,10 +177,20 @@ def test_python_client_uses_only_the_standard_library() -> None:
     client = (ROOT / "static" / "vault.py").read_text(encoding="utf-8")
     imports = re.findall(r"^(?:from|import) ([a-z0-9_.]+)", client, flags=re.MULTILINE)
     allowed = {"__future__", "argparse", "base64", "http.client", "json", "mimetypes", "os", "re",
-               "sys", "threading", "time", "urllib.parse", "uuid", "concurrent.futures", "pathlib", "datetime"}
+               "sys", "threading", "time", "urllib.parse", "uuid", "concurrent.futures", "pathlib", "datetime",
+               "shutil", "traceback", "unicodedata"}
     assert set(imports) <= allowed, set(imports) - allowed
     assert 'DEFAULT_SERVER = ""' in client and 'DEFAULT_API_KEY = ""' in client
     assert "cv_live_" not in client, "never ship a real key in the template"
+
+
+def test_confirm_dialog_is_available_on_every_signed_in_page() -> None:
+    # Revoke, remove-member and similar forms confirm through [data-confirm]. If the dialog only
+    # exists on the vault page, every other page falls back to window.confirm(), which a browser
+    # can suppress, and the action then silently does nothing.
+    shell = (ROOT / "templates" / "app_base.html").read_text(encoding="utf-8")
+    assert "data-confirm " in shell and "data-confirm-ok" in shell
+    assert "data-confirm-ok" not in (ROOT / "templates" / "dashboard.html").read_text(encoding="utf-8")
 
 
 def test_fonts_are_self_hosted() -> None:

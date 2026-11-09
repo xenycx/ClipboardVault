@@ -31,8 +31,10 @@
   </section>
 
   <section class="panel">
-    <header class="panel-head"><h2>Python client</h2><p>One file, no packages to install. Uploads and downloads any size with resumable transfers. Runs on Python 3.8 or newer.</p></header>
-    <pre class="snippet"><code><span class="c"># upload files or a folder's contents</span>
+    <header class="panel-head"><h2>Python client</h2><p>One file, no packages to install. Run it with no arguments, or double-click it on Windows, for a full-screen browser with search, paging, file pickers, and resumable uploads and downloads of any size. Python 3.8 or newer.</p></header>
+    <pre class="snippet"><code><span class="c"># full-screen interface: browse, search, pick files, download</span>
+python vault.py
+<span class="c"># or use commands: upload files or a folder's contents</span>
 python vault.py up report.pdf photos/*.jpg
 <span class="c"># list, search, and download</span>
 python vault.py ls invoice
@@ -40,7 +42,7 @@ python vault.py get 3f2a9c1e
 <span class="c"># save text from a pipe, read it back</span>
 git diff | python vault.py paste --tag diff
 python vault.py cat 3f2a9c1e</code></pre>
-    <p class="panel-note">Creating a key gives you a copy with the key and <code>{{ server_url }}</code> already filled in. This copy reads <code>VAULT_SERVER</code> and <code>VAULT_API_KEY</code> from the environment.</p>
+    <p class="panel-note">Creating a key gives you a copy with the key and <code>{{ server_url }}</code> already filled in. This copy has no key inside, so it is safe on a shared or network folder; it asks for the address and key on first run and saves them in your user profile.</p>
     <div class="panel-actions"><a class="button" href="{{ "/static/vault.py"|asset }}" download="vault.py"><svg class="i" aria-hidden="true"><use href="#i-terminal"/></svg><span>Download vault.py</span></a></div>
   </section>
 </div>

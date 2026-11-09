@@ -384,7 +384,7 @@ first has to be published (below), and then the template in the RivetPanel repos
 | Setting | Value |
 | --- | --- |
 | Service | `app`, one container |
-| Image | `ghcr.io/xenycx/clipboard-vault:3.0.0`, pinned (never `:latest`) |
+| Image | `ghcr.io/xenycx/clipboard-vault:3.0.1`, pinned (never `:latest`) |
 | User | `10001:10001` |
 | Volume | `data` mounted at `/data` (database, uploads, snapshots), included in RivetPanel backups |
 | Health | `/health/live` on port 8080 |
@@ -403,7 +403,7 @@ an existing tag:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t ghcr.io/xenycx/clipboard-vault:3.0.0 -t ghcr.io/xenycx/clipboard-vault:3.0 --push .
+  -t ghcr.io/xenycx/clipboard-vault:3.0.1 -t ghcr.io/xenycx/clipboard-vault:3.0 --push .
 ```
 
 Log in to the registry with a token that can write packages first, and set the package to

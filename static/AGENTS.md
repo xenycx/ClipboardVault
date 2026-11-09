@@ -9,7 +9,7 @@ This directory is the asset half of the server-rendered frontend. There is no bu
 - `theme.js`: applied before first paint, so the theme never flashes. It must stay a separate file because the CSP forbids inline scripts; the same rule bans inline event handlers such as `onchange`.
 - `vendor/`: pinned, locally served third-party preview libraries and styles. Do not edit minified vendor files manually.
 - `fonts/`: self-hosted IBM Plex Sans and Mono (OFL). The CSP forbids remote fonts.
-- `vault.py`: the dependency-free Python client. Keep `DEFAULT_SERVER = ""` and `DEFAULT_API_KEY = ""` exactly as written; the key-created page fills them in by string replacement.
+- `vault.py`: the dependency-free Python client: commands plus a full-screen terminal interface (no arguments / double-click). Keep `DEFAULT_SERVER = ""` and `DEFAULT_API_KEY = ""` exactly as written; the key-created page fills them in by string replacement. It must run from a UNC path (never depend on the working directory, keep settings in the user profile), on Python 3.8, with only the standard library; `tests/test_vault_client.py` drives it against a fake server.
 
 ## DOM contract
 

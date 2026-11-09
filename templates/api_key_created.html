@@ -18,8 +18,9 @@
       <h3>Python client with this key</h3>
       <button class="button primary" type="button" data-download-script><svg class="i" aria-hidden="true"><use href="#i-download"/></svg><span>Download vault.py</span></button>
     </div>
-    <p class="pane-lede">One file, standard library only. The server address and this key are already inside, so anyone holding the file can use the key. Keep it private.</p>
-    <pre class="snippet"><code>python vault.py up ./screenshot.png
+    <p class="pane-lede">One file, standard library only. The server address and this key are already inside, so anyone holding the file can use the key. Keep it private, and do not put it on a shared or network folder; use the blank copy from Keys and team there.</p>
+    <pre class="snippet"><code>python vault.py
+python vault.py up ./screenshot.png
 python vault.py ls
 python vault.py get &lt;id&gt; -o ~/Downloads{% if !can_read %}
 

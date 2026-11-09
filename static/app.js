@@ -193,7 +193,22 @@
     confirmDialog.returnValue = "";
     confirmDialog.showModal();
     return new Promise((resolve) => {
-      confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "ok"), { once: true });
+      let settled = false;
+      const settle = (accepted) => {
+        if (settled) return;
+        settled = true;
+        confirmDialog.removeEventListener("close", onClose);
+        confirmDialog.removeEventListener("click", onClick);
+        resolve(accepted);
+      };
+      // The button click answers at once; "close" covers Escape and the Cancel default.
+      const onClick = (event) => {
+        const button = event.target.closest?.("button[value]");
+        if (button) settle(button.value === "ok");
+      };
+      const onClose = () => settle(confirmDialog.returnValue === "ok");
+      confirmDialog.addEventListener("click", onClick);
+      confirmDialog.addEventListener("close", onClose);
     });
   };
 

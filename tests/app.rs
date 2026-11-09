@@ -582,6 +582,100 @@ async fn api_keys_are_scoped_by_permission_and_workspace() {
 }
 
 #[tokio::test]
+async fn members_revoke_their_own_keys_and_managers_revoke_any() {
+    let app = app().await;
+    let owner = app.admin().await;
+    let invite = app
+        .post_form("/invitations/create", "role=member", &owner)
+        .await
+        .text();
+    let start = invite.find("/join/").unwrap() + 6;
+    let token: String = invite[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let member = app.sign_up("Mia", "mia@example.com", "mia password").await;
+    let mia_id = app
+        .scalar("SELECT id FROM users WHERE email = 'mia@example.com'")
+        .await;
+    app.post_form(&format!("/admin/users/{mia_id}/approve"), "", &owner)
+        .await;
+    app.post_form(&format!("/join/{token}"), "", &member).await;
+    let shared = app
+        .scalar("SELECT workspace_id FROM memberships WHERE role = 'member'")
+        .await;
+    let member = format!("{member}; vault_workspace={shared}");
+    let owner_shared = format!("{owner}; vault_workspace={shared}");
+
+    let owner_key = app.create_key(&owner_shared, "&read=on").await;
+    let member_key = app.create_key(&member, "&read=on").await;
+    let owner_key_id = app
+        .scalar("SELECT id FROM api_keys WHERE created_by_user_id != (SELECT id FROM users WHERE email = 'mia@example.com') LIMIT 1")
+        .await;
+    let member_key_id = app
+        .scalar(&format!(
+            "SELECT id FROM api_keys WHERE created_by_user_id = '{mia_id}'"
+        ))
+        .await;
+
+    let page = app.get("/keys", Some(&member)).await.text();
+    assert!(
+        page.contains(&format!("/keys/{member_key_id}/revoke")),
+        "a member sees their own key"
+    );
+    assert!(
+        !page.contains(&format!("/keys/{owner_key_id}/revoke")),
+        "and not the owner's"
+    );
+    assert_eq!(
+        app.post_form(&format!("/keys/{owner_key_id}/revoke"), "", &member)
+            .await
+            .status,
+        StatusCode::FORBIDDEN,
+        "members cannot revoke other people's keys"
+    );
+    let revoked = app
+        .post_form(&format!("/keys/{member_key_id}/revoke"), "", &member)
+        .await;
+    assert_eq!(revoked.status, StatusCode::SEE_OTHER, "{}", revoked.text());
+    assert_eq!(
+        app.api(Method::GET, "/api/v1/items", &member_key, None)
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.api(Method::GET, "/api/v1/items", &owner_key, None)
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // A manager can revoke a key somebody else made.
+    let again = app.create_key(&member, "&read=on").await;
+    let again_id = app
+        .scalar(&format!(
+            "SELECT id FROM api_keys WHERE created_by_user_id = '{mia_id}'"
+        ))
+        .await;
+    let by_owner = app
+        .post_form(&format!("/keys/{again_id}/revoke"), "", &owner_shared)
+        .await;
+    assert_eq!(
+        by_owner.status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        by_owner.text()
+    );
+    assert_eq!(
+        app.api(Method::GET, "/api/v1/items", &again, None)
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn credentials_imported_from_better_auth_keep_working() {
     let app = app().await;
     let now = "2026-01-01T00:00:00.000000Z";
