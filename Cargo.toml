@@ -1,6 +1,6 @@
 [package]
 name = "clipboard-vault"
-version = "3.0.1"
+version = "3.0.2"
 edition = "2024"
 license = "MIT"
 description = "A fast, self-hosted team vault for pasted content and files"

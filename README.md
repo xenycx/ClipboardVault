@@ -321,10 +321,11 @@ python vault.py
   (`t`), open an item to read its full text, select several items (Space, `a` for the page; the
   selection survives page changes) and download them (`d`) with live progress. `x` moves items to
   the trash; `Tab` switches to the trash, where `r` restores and `p` deletes for good.
-* **Upload files**: a file browser. Space selects a file or a whole folder, selections are kept
-  while you move between folders, `g` jumps to any typed or pasted path, `p` lists drives and
-  recent places, `/` filters the current folder. Folders can be uploaded with their sub-folder
-  structure. Uploads run in parallel, report per-file progress, and can be cancelled with Esc
+* **Upload files**: a file browser that opens in the folder the script itself is in (so a script
+  on `\\fileserver\tools` lists that share). Space selects a file or a whole folder, selections are kept
+  while you move between folders, `g` jumps to any typed or pasted path, going up past the top (or `p`) lists drives and
+  recent places, Settings can pin a different start folder, `/` filters the current folder.
+  Folders can be uploaded with their sub-folder structure. Uploads run in parallel, report per-file progress, and can be cancelled with Esc
   (large files resume the next time you upload them).
 * **New text note**, **Storage**, and **Settings** (server, key, download folder, parallel transfers).
 
@@ -361,8 +362,11 @@ python vault.py cat 3f2a9c1e                       # print to stdout
 python vault.py rm 3f2a9c1e && python vault.py empty-trash --yes
 ```
 
-Files up to 90 MiB stream through one multipart request; larger files (or `--resumable`)
-use Tus and resume automatically when the command is run again. `get` without `-o` saves into the
+Files up to 8 MiB go in one request. Anything larger is uploaded in resumable chunks (the size the
+server advertises, 16 MiB by default): the next chunk is read from disk or the network share while
+the current one is on the wire, progress and Esc respond within a quarter of a megabyte, and
+several files transfer at once (4 by default; Settings changes it). If a transfer is cancelled or the
+connection drops, uploading the same file again continues where it stopped. `get` without `-o` saves into the
 current folder, or into your Downloads folder when the current folder is not usable. Hidden
 files and folders are skipped when a folder is uploaded.
 

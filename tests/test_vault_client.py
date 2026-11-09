@@ -43,6 +43,11 @@ class FakeVault:
         self.uploads = []
         self.contents = {}
         self.calls = []
+        self.tus = {}                 # upload id -> {"length", "data", "meta"}
+        self.tus_chunk = 512 * 1024   # what OPTIONS advertises
+        self.patches = []             # (offset, length) of every accepted PATCH
+        self.fail_next_patch = False
+        self.after_patch = None
 
     def make(self, name, kind, size=0, created=None, content=b"", text=None):
         item_id = uuid.uuid4().hex[:8] + "-0000-4000-8000-" + uuid.uuid4().hex[:12]
@@ -82,6 +87,33 @@ def make_handler(vault: FakeVault):
         def body(self):
             return self.rfile.read(int(self.headers.get("Content-Length") or 0))
 
+        def do_OPTIONS(self):
+            self.reply(204, raw=b"", headers={"X-Tus-Chunk-Size": str(vault.tus_chunk), "Tus-Resumable": "1.0.0"})
+
+        def do_HEAD(self):
+            upload = vault.tus.get(self.path.rsplit("/", 1)[-1])
+            if not upload:
+                return self.reply(404, raw=b"")
+            self.reply(200, raw=b"", headers={"Upload-Offset": str(len(upload["data"])), "Upload-Length": str(upload["length"])})
+
+        def do_PATCH(self):
+            if not self.authorized():
+                return
+            upload = vault.tus.get(self.path.rsplit("/", 1)[-1])
+            body = self.body()
+            if not upload:
+                return self.reply(404, {"error": {"message": "gone"}})
+            if vault.fail_next_patch:
+                vault.fail_next_patch = False
+                return self.reply(500, {"error": {"message": "try again"}})
+            if int(self.headers["Upload-Offset"]) != len(upload["data"]):
+                return self.reply(409, {"error": {"message": "offset"}})
+            upload["data"] += body
+            vault.patches.append((len(upload["data"]) - len(body), len(body)))
+            if vault.after_patch:
+                vault.after_patch()
+            self.reply(204, raw=b"", headers={"Upload-Offset": str(len(upload["data"]))})
+
         def do_GET(self):
             if not self.authorized():
                 return
@@ -102,6 +134,11 @@ def make_handler(vault: FakeVault):
                 page = pool[:limit]
                 more = len(pool) > limit
                 return self.reply(200, {"items": page, "next_cursor": page[-1]["created_at"] if more else None})
+            match = re.fullmatch(r"/api/v1/uploads/([^/]+)/status", url.path)
+            if match and match.group(1) in vault.tus:
+                upload = vault.tus[match.group(1)]
+                done = len(upload["data"]) == upload["length"]
+                return self.reply(200, {"state": "completed" if done else "uploading", "itemId": match.group(1) if done else None})
             if url.path == "/api/v1/storage":
                 return self.reply(200, {"workspace_name": "Main", "workspace_bytes": 2048, "reserved_upload_bytes": 0,
                                         "reclaimable_bytes": 0, "free_bytes": 10 ** 9, "total_bytes": 2 * 10 ** 9, "low_storage": False})
@@ -115,6 +152,16 @@ def make_handler(vault: FakeVault):
                 return
             data = self.body()
             vault.calls.append(("POST", self.path))
+            if self.path == "/api/v1/uploads":
+                import base64
+                meta = {}
+                for pair in (self.headers.get("Upload-Metadata") or "").split(","):
+                    key, _, value = pair.strip().partition(" ")
+                    if key:
+                        meta[key] = base64.b64decode(value).decode()
+                upload_id = uuid.uuid4().hex
+                vault.tus[upload_id] = {"length": int(self.headers["Upload-Length"]), "data": b"", "meta": meta}
+                return self.reply(201, raw=b"", headers={"Location": f"/api/v1/uploads/{upload_id}"})
             if self.path == "/api/v1/items/bulk":
                 request = json.loads(data)
                 hit = [i for i in vault.items if i["id"] in request["ids"]]
@@ -304,7 +351,7 @@ def test_upload_files_from_the_picker_with_folder_and_tags(vault_module, vault_s
     keys = (["u", "a", "u", "enter"]                         # all files here, upload, accept "/"
             + ["x", ",", "y", "enter"] + ["y"] + ["enter"]   # tags "x,y", start, close the progress screen
             + ["q"])
-    ui, term = make_ui(vault_module, vault_server, keys, tmp_path, last_dir=str(source))
+    ui, term = make_ui(vault_module, vault_server, keys, tmp_path, start_dir=str(source))
     ui.menu()
     names = sorted(u["name"] for u in vault_server.uploads)
     assert names == ["a.txt", "b.txt"]                       # hidden files and sub-folders are not taken by "a"
@@ -320,7 +367,7 @@ def test_upload_a_folder_keeping_its_structure(vault_module, vault_server, tmp_p
     (source / "photos" / "2026" / "deep.txt").write_text("2")
     # cursor starts on "..", move to "photos", select the folder, upload
     keys = ["u", "down", " ", "u", "enter", "enter", "y", "y", "enter", "q"]
-    ui, term = make_ui(vault_module, vault_server, keys, tmp_path, last_dir=str(source))
+    ui, term = make_ui(vault_module, vault_server, keys, tmp_path, start_dir=str(source))
     ui.menu()
     folders = {u["name"]: u["folder"] for u in vault_server.uploads}
     assert folders == {"top.txt": "/photos", "deep.txt": "/photos/2026"}
@@ -332,7 +379,7 @@ def test_go_to_path_accepts_quoted_paths_and_selects_a_file(vault_module, vault_
     (target / "one.txt").write_text("1")
     quoted = '"' + str(target) + '"'
     keys = ["u", "g"] + type_text(quoted) + ["enter", "a", "u", "enter", "enter", "y", "enter", "q"]
-    ui, term = make_ui(vault_module, vault_server, keys, tmp_path, last_dir=str(tmp_path))
+    ui, term = make_ui(vault_module, vault_server, keys, tmp_path, start_dir=str(tmp_path))
     ui.menu()
     assert [u["name"] for u in vault_server.uploads] == ["one.txt"]
     assert str(target) in vault_module.load_config()["recent_paths"]
@@ -449,3 +496,102 @@ def test_real_terminal_smoke_test(vault_server, tmp_path):
     _, status = os.waitpid(pid, 0)
     assert os.WEXITSTATUS(status) == 0
     assert b"\x1b[?1049h" in output and b"\x1b[?1049l" in output, "enters and leaves the alternate screen"
+
+
+# ----------------------------------------------------- start folder, chunked uploads
+
+def test_the_picker_opens_in_the_folder_the_script_is_in(vault_module, vault_server, tmp_path):
+    ui, term = make_ui(vault_module, vault_server, ["u", "q", "q"], tmp_path)
+    ui.menu()
+    picker = next(f for f in term.frames if "choose files" in f.splitlines()[0])
+    assert str(SCRIPT.parent) in picker.splitlines()[1]
+    assert "vault.py" in picker, "the script's own folder is what gets listed"
+
+
+def test_a_pinned_start_folder_beats_the_script_folder(vault_module, vault_server, tmp_path):
+    (tmp_path / "pinned").mkdir()
+    (tmp_path / "pinned" / "mine.txt").write_text("x")
+    ui, term = make_ui(vault_module, vault_server, ["u", "q", "q"], tmp_path, start_dir=str(tmp_path / "pinned"))
+    ui.menu()
+    picker = next(f for f in term.frames if "choose files" in f.splitlines()[0])
+    assert "mine.txt" in picker and "vault.py" not in picker
+
+
+def test_a_missing_start_folder_falls_back_without_error(vault_module, tmp_path):
+    cfg = {"start_dir": str(tmp_path / "does-not-exist")}
+    assert vault_module.start_folder(cfg) == str(SCRIPT.parent)
+
+
+def test_large_files_go_in_chunks_and_small_ones_in_one_request(vault_module, vault_server, tmp_path):
+    v = vault_module
+    client = v.Client(vault_server.url, KEY)
+    big = tmp_path / "big.bin"
+    big.write_bytes(os.urandom(v.MULTIPART_MAX + 1_500_000))
+    small = tmp_path / "small.bin"
+    small.write_bytes(b"s" * 1000)
+    v.upload_one(client, small, "/s", ["a"])
+    assert vault_server.patches == [] and vault_server.uploads[-1]["name"] == "small.bin"
+    item_id = v.upload_one(client, big, "/b", ["t1", "t2"])
+    upload = vault_server.tus[item_id]
+    assert upload["data"] == big.read_bytes()
+    assert upload["meta"]["filename"] == "big.bin" and upload["meta"]["virtualPath"] == "/b"
+    assert all(length <= vault_server.tus_chunk for _, length in vault_server.patches)
+    assert len(vault_server.patches) == -(-big.stat().st_size // vault_server.tus_chunk)
+    assert [o for o, _ in vault_server.patches] == sorted(o for o, _ in vault_server.patches)
+
+
+def test_a_failed_chunk_is_retried_without_resending_earlier_ones(vault_module, vault_server, tmp_path):
+    v = vault_module
+    client = v.Client(vault_server.url, KEY)
+    path = tmp_path / "retry.bin"
+    path.write_bytes(os.urandom(1_300_000))
+    vault_server.fail_next_patch = True
+    item_id = v.upload_one(client, path, "/", [], resumable=True)
+    assert vault_server.tus[item_id]["data"] == path.read_bytes()
+    assert len({o for o, _ in vault_server.patches}) == len(vault_server.patches), "no chunk was accepted twice"
+
+
+def test_cancel_mid_upload_then_resume_sends_only_the_rest(vault_module, vault_server, tmp_path):
+    v = vault_module
+    client = v.Client(vault_server.url, KEY)
+    path = tmp_path / "resume.bin"
+    payload = os.urandom(2_600_000)
+    path.write_bytes(payload)
+    cancel = threading.Event()
+    vault_server.after_patch = cancel.set                     # Esc pressed once the first chunk landed
+    job = v.Job("resume.bin", len(payload))
+    with pytest.raises(v.VaultError, match="cancelled"):
+        v.upload_one(client, path, "/", [], resumable=True, job=job, cancel=cancel)
+    sent_first = sum(length for _, length in vault_server.patches)
+    assert 0 < sent_first < len(payload)
+    assert v.load_resumes(), "the upload is remembered so it can continue"
+
+    vault_server.after_patch = None
+    item_id = v.upload_one(client, path, "/", [], resumable=True)
+    (upload,) = vault_server.tus.values()
+    assert upload["data"] == payload
+    assert sum(length for _, length in vault_server.patches) == len(payload), "nothing was sent twice"
+    assert item_id and not v.load_resumes()
+
+
+def test_progress_moves_inside_a_chunk(vault_module, vault_server, tmp_path):
+    v = vault_module
+    client = v.Client(vault_server.url, KEY)
+    vault_server.tus_chunk = 4 * 1024 * 1024
+    path = tmp_path / "smooth.bin"
+    path.write_bytes(os.urandom(3_000_000))
+    seen = []
+    job = v.Job("smooth.bin", path.stat().st_size)
+
+    class Spy(v.Progress):
+        def update(self, done, force=False):
+            seen.append(done)
+            super().update(done, force)
+
+    original = v.Progress
+    v.Progress = Spy
+    try:
+        v.upload_one(client, path, "/", [], resumable=True, job=job)
+    finally:
+        v.Progress = original
+    assert len([d for d in seen if 0 < d < path.stat().st_size]) > 5, "one 3 MB chunk still reports many steps"

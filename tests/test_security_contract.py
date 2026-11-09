@@ -178,7 +178,7 @@ def test_python_client_uses_only_the_standard_library() -> None:
     imports = re.findall(r"^(?:from|import) ([a-z0-9_.]+)", client, flags=re.MULTILINE)
     allowed = {"__future__", "argparse", "base64", "http.client", "json", "mimetypes", "os", "re",
                "sys", "threading", "time", "urllib.parse", "uuid", "concurrent.futures", "pathlib", "datetime",
-               "shutil", "traceback", "unicodedata"}
+               "shutil", "traceback", "unicodedata", "queue", "socket"}
     assert set(imports) <= allowed, set(imports) - allowed
     assert 'DEFAULT_SERVER = ""' in client and 'DEFAULT_API_KEY = ""' in client
     assert "cv_live_" not in client, "never ship a real key in the template"

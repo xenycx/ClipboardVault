@@ -44,8 +44,10 @@ import http.client
 import json
 import mimetypes
 import os
+import queue
 import re
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -61,7 +63,8 @@ DEFAULT_API_KEY = ""
 
 VERSION = "3.0"
 TUS_VERSION = "1.0.0"
-MULTIPART_MAX = 90 * 1024 * 1024          # below the server's 100 MiB classic limit
+MULTIPART_MAX = 8 * 1024 * 1024           # bigger files go in resumable chunks (the server allows 100 MiB per classic request)
+SEND_STEP = 256 * 1024                    # progress and cancel granularity while a chunk is on the wire
 DEFAULT_CHUNK = 16 * 1024 * 1024
 READ_BLOCK = 1024 * 1024
 WIN = os.name == "nt"
@@ -158,6 +161,22 @@ def clean_path(text: str) -> str:
     return os.path.expandvars(os.path.expanduser(text)) if text else ""
 
 
+def script_dir() -> str | None:
+    """The folder this script was started from (a \\\\server\\share\\... folder when it lives on a share)."""
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:                    # embedded or frozen: there is no file
+        return None
+
+
+def start_folder(cfg: dict) -> str:
+    """Where the upload picker opens: an explicit setting, else the folder holding this script."""
+    for candidate in (os.environ.get("VAULT_START_DIR"), cfg.get("start_dir"), script_dir()):
+        if candidate and os.path.isdir(fs(clean_path(str(candidate)))):
+            return os.path.abspath(clean_path(str(candidate)))
+    return str(home_dir())
+
+
 def windows_drives() -> list:
     import ctypes
     kernel, mpr = ctypes.windll.kernel32, getattr(ctypes.windll, "mpr", None)
@@ -225,8 +244,14 @@ class Client:
         if current is not None:
             current.close()
         cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        self.local.conn = cls(self.host, self.port, timeout=300)
-        return self.local.conn
+        conn = self.local.conn = cls(self.host, self.port, timeout=300)
+        try:                                   # connect now to tune the socket; failures resurface on the request
+            conn.connect()
+            conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except OSError:
+            pass
+        return conn
 
     def drop(self) -> None:
         """Forget this thread's connection; use after a request was abandoned half way."""
@@ -257,7 +282,8 @@ class Client:
                 if attempt == 2 or (body is not None and not isinstance(body, (bytes, str))):
                     raise
             except OSError as error:
-                if attempt == 2:
+                # A streamed body is used up once sent, so only the caller can retry it.
+                if attempt == 2 or (body is not None and not isinstance(body, (bytes, str))):
                     raise VaultError(f"Could not reach {self.origin}: {error}") from error
                 time.sleep(1 + attempt)
         raise VaultError("unreachable")
@@ -440,18 +466,86 @@ def multipart_upload(client: Client, path: Path, folder: str, tags: list, job=No
     return json.loads(data)
 
 
+class ChunkReader:
+    """Reads the file ahead of the network, so a slow disk or network share overlaps with the upload."""
+
+    def __init__(self, path, offset: int, size: int, chunk: int):
+        self.path, self.size, self.chunk = path, size, chunk
+        self.stop = threading.Event()
+        self.queue = queue.Queue(maxsize=1)
+        self.begin(offset)
+
+    def begin(self, offset: int):
+        self.stop, self.queue = threading.Event(), queue.Queue(maxsize=1)
+        threading.Thread(target=self.run, args=(offset, self.stop, self.queue), daemon=True).start()
+
+    def run(self, offset: int, stop: threading.Event, out: queue.Queue):
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    out.put(item, timeout=0.2)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        try:
+            with open(fs(self.path), "rb") as handle:
+                handle.seek(offset)
+                while offset < self.size and not stop.is_set():
+                    block = handle.read(min(self.chunk, self.size - offset))
+                    if not block:
+                        raise OSError(f"{os.path.basename(str(self.path))} ended early; did it change while uploading?")
+                    if not put((offset, block)):
+                        return
+                    offset += len(block)
+        except BaseException as error:
+            put(error)
+
+    def next(self, cancel=None):
+        while True:
+            try:
+                item = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                if cancel is not None and cancel.is_set():
+                    raise VaultError("cancelled")
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    def reset(self, offset: int):
+        self.stop.set()
+        self.begin(offset)
+
+    def close(self):
+        self.stop.set()
+
+
+def chunk_body(block: bytes, base: int, progress: "Progress"):
+    """Feeds one chunk to the socket in slices, so progress moves and Esc takes effect during the chunk."""
+    view = memoryview(block)
+    for start in range(0, len(view), SEND_STEP):
+        piece = view[start:start + SEND_STEP]
+        yield piece
+        progress.update(base + start + len(piece))
+
+
 def tus_upload(client: Client, path: Path, folder: str, tags: list, job=None, cancel=None) -> str:
     stat = os.stat(fs(path))
     size = stat.st_size
     resume_key = f"{client.origin}|{os.path.abspath(str(path))}|{size}|{int(stat.st_mtime)}"
-    chunk = DEFAULT_CHUNK
-    response, _ = client.request("OPTIONS", "/api/v1/uploads")
-    try:
-        advertised = int(response.getheader("X-Tus-Chunk-Size") or 0)
-        if advertised > 0:
-            chunk = min(advertised, DEFAULT_CHUNK)
-    except ValueError:
-        pass
+    chunk = getattr(client, "tus_chunk", 0)
+    if not chunk:
+        chunk = DEFAULT_CHUNK
+        response, _ = client.request("OPTIONS", "/api/v1/uploads")
+        try:
+            advertised = int(response.getheader("X-Tus-Chunk-Size") or 0)
+            if advertised > 0:
+                chunk = min(advertised, DEFAULT_CHUNK)
+        except ValueError:
+            pass
+        client.tus_chunk = chunk
 
     upload_path = None
     offset = 0
@@ -488,17 +582,23 @@ def tus_upload(client: Client, path: Path, folder: str, tags: list, job=None, ca
     progress = Progress(path.name, size, job, cancel)
     progress.base = offset
     progress.update(offset)
-    with open(fs(path), "rb") as handle:
+    reader = ChunkReader(path, offset, size, chunk) if offset < size else None
+    try:
         while offset < size:
-            handle.seek(offset)
-            block = handle.read(min(chunk, size - offset))
+            at, block = reader.next(cancel)
+            if at != offset:                       # the server's offset moved (resume or conflict): read from there
+                reader.reset(offset)
+                continue
             for attempt in range(5):
                 try:
-                    response, data = client.request("PATCH", upload_path, body=block, headers={
+                    response, data = client.request("PATCH", upload_path, body=chunk_body(block, offset, progress), headers={
                         "Tus-Resumable": TUS_VERSION, "Upload-Offset": str(offset),
-                        "Content-Type": "application/offset+octet-stream",
+                        "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(block)),
                     })
                 except (OSError, http.client.HTTPException, VaultError):
+                    client.drop()                  # a half-sent body leaves the connection unusable
+                    if cancel is not None and cancel.is_set():
+                        raise VaultError("cancelled")
                     response = None
                 if response is not None and response.status in (200, 204):
                     offset = int(response.getheader("Upload-Offset"))
@@ -510,13 +610,17 @@ def tus_upload(client: Client, path: Path, folder: str, tags: list, job=None, ca
                 if response is not None and response.status < 500 and response.status != 408:
                     save_resume(resume_key, None)
                     raise VaultError(error_text(response.status, data))
-                time.sleep(min(2 ** attempt, 15))
+                time.sleep(0 if attempt == 0 else min(2 ** attempt, 15))
                 progress.update(offset)
             else:
                 raise VaultError(f"{path.name}: connection kept failing at {fmt_size(offset)}. Run the same command again to resume.")
             progress.update(offset)
+    finally:
+        if reader is not None:
+            reader.close()
     progress.finish()
 
+    delay = 0.05
     for _ in range(600):
         status = client.json("GET", upload_path.rstrip("/") + "/status")
         state = str(status.get("state", "")).lower()
@@ -528,7 +632,8 @@ def tus_upload(client: Client, path: Path, folder: str, tags: list, job=None, ca
             raise VaultError(f"{path.name}: upload {state} ({status.get('error') or status.get('errorCode') or 'no detail'})")
         if cancel is not None and cancel.is_set():
             raise VaultError("cancelled")
-        time.sleep(0.5)
+        time.sleep(delay)
+        delay = min(delay * 2, 0.5)
     raise VaultError(f"{path.name}: the server is still verifying the file; check `ls` shortly.")
 
 
@@ -1651,8 +1756,7 @@ class UI:
 
     def pick_files(self):
         """File browser. Returns [(path, is_dir)] or None. Folders are expanded at upload time."""
-        start = self.cfg.get("last_dir")
-        here = start if start and os.path.isdir(fs(start)) else str(home_dir())
+        here = start_folder(self.cfg)
         selected = {}            # path -> is_dir, kept while moving between folders
         pos = Pos()
         needle, hidden = "", False
@@ -1784,7 +1888,7 @@ class UI:
 
     def remember(self, folder: str):
         recent = [p for p in (self.cfg.get("recent_paths") or []) if p != folder]
-        self.persist(last_dir=folder, recent_paths=([folder] + recent)[:8])
+        self.persist(recent_paths=([folder] + recent)[:8])
 
     # ---- notes, storage, settings
 
@@ -1854,6 +1958,7 @@ class UI:
                 ("Server address", self.server or "(not set)"),
                 ("API key", masked or "(not set)"),
                 ("Download folder", str(downloads_dir(self.cfg))),
+                ("Upload start folder", str(self.cfg.get("start_dir") or "") or f"(this script's folder: {script_dir() or 'unknown'})"),
                 ("Parallel transfers", str(self.workers)),
                 ("Test the connection", ""),
                 ("Forget saved settings", f"removes {CONFIG_FILE}"),
@@ -1894,15 +1999,19 @@ class UI:
                 if value:
                     self.persist(download_dir=clean_path(value))
             elif pos.cur == 3:
+                value = self.prompt("Settings", "Folder the upload picker opens in (empty = the folder this script is in)", str(self.cfg.get("start_dir") or ""))
+                if value is not None:
+                    self.persist(start_dir=clean_path(value) or None)
+            elif pos.cur == 4:
                 value = self.prompt("Settings", "How many files to transfer at once (1-16)", str(self.workers))
                 if value and value.isdigit():
                     self.workers = max(1, min(int(value), 16))
                     self.persist(jobs=self.workers)
-            elif pos.cur == 4:
+            elif pos.cur == 5:
                 self.splash("Checking…", "Settings")
                 self.flash("Connected." if self.connect() else (self.status[0] if self.status else "Failed"),
                            "ok" if self.client and self.status is None else "err")
-            elif pos.cur == 5:
+            elif pos.cur == 6:
                 if self.confirm("Forget the saved server, key, and preferences?"):
                     try:
                         CONFIG_FILE.unlink()
